@@ -1,3 +1,8 @@
+> **Superseded by [`transition_dipole.md`](transition_dipole.md).**
+> This model regresses the adiabatic oscillator strengths directly. On the
+> DiKTA S1 ensemble that target is discontinuous, and the trained model
+> scored negative R2 even on its own training split. Kept for reference.
+
 # Oscillator-strength transfer learning
 
 This implementation is independent of X-MACE. It uses MACE-OFF as an
