@@ -55,6 +55,12 @@ from .models import (
     EnergyDipolesMACE,
     ScaleShiftMACE,
 )
+from .oscillator import (
+    InvariantFeatures,
+    OscillatorStrengthLoss,
+    OscillatorStrengthMACE,
+    target_statistics,
+)
 from .radial import BesselBasis, GaussianBasis, PolynomialCutoff, ZBLBasis
 from .symmetric_contraction import SymmetricContraction
 from .utils import (
@@ -128,6 +134,10 @@ __all__ = [
     "MagneticSCFMACE",
     "TimeReversalSymmetrizedMACE",
     "PolarMACE",
+    "InvariantFeatures",
+    "OscillatorStrengthLoss",
+    "OscillatorStrengthMACE",
+    "target_statistics",
     "LinearLesReadoutBlock",
     "NonLinearLesReadoutBlock",
     "WeightedEnergyForcesLoss",
