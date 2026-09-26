@@ -13,6 +13,7 @@ from mace import data
 from mace.tools import AtomicNumberTable
 
 TARGET_KEYS = ("REF_energy_ex", "REF_tdm", "REF_osce")
+SOLVATION_KEYS = ("REF_susceptibility", "REF_gp")
 
 
 def read_tdm_data(
@@ -20,19 +21,28 @@ def read_tdm_data(
     backbone: torch.nn.Module,
     num_states: int,
     require_targets: bool = True,
+    solvation: bool = False,
 ) -> Tuple[List[data.AtomicData], Dict[str, torch.Tensor], List[Atoms]]:
+    """Read graphs and targets.
+
+    With ``solvation`` the NEMO susceptibilities ``REF_susceptibility``
+    (per state, eV) and ground-state polarization ``REF_gp`` (eV) are read as
+    well; they are required whenever ``require_targets`` is.
+    """
     atoms_list = read(path, index=":", format="extxyz")
     z_table = AtomicNumberTable([int(z) for z in backbone.atomic_numbers])
     dtype = torch.get_default_dtype()
     graphs: List[data.AtomicData] = []
     energies, dipoles, strengths = [], [], []
+    susceptibilities, polarizations = [], []
+    required = TARGET_KEYS + (SOLVATION_KEYS if solvation else ())
     for index, atoms in enumerate(atoms_list):
         if require_targets:
-            missing = [key for key in TARGET_KEYS if key not in atoms.info]
+            missing = [key for key in required if key not in atoms.info]
             if missing:
                 raise KeyError(
                     f"configuration {index} is missing {missing}; "
-                    "rebuild the dataset with logs2xyz.py"
+                    "rebuild the dataset with db2xyz.py"
                 )
         if all(key in atoms.info for key in TARGET_KEYS):
             energy = np.asarray(atoms.info["REF_energy_ex"], float).reshape(-1)
@@ -65,6 +75,27 @@ def read_tdm_data(
         graph.energy_ex = torch.tensor(energy, dtype=dtype).reshape(1, -1)
         graph.tdm = torch.tensor(dipole, dtype=dtype).reshape(1, num_states, 3)
         graph.osce = torch.tensor(strength, dtype=dtype).reshape(1, -1)
+        if solvation:
+            if all(key in atoms.info for key in SOLVATION_KEYS):
+                susceptibility = np.asarray(
+                    atoms.info["REF_susceptibility"], float
+                ).reshape(-1)
+                if susceptibility.size < num_states:
+                    raise ValueError(
+                        f"configuration {index} has fewer than {num_states} "
+                        "susceptibilities"
+                    )
+                susceptibility = susceptibility[:num_states]
+                polarization = float(atoms.info["REF_gp"])
+            else:
+                susceptibility = np.full(num_states, np.nan)
+                polarization = np.nan
+            graph.susceptibility = torch.tensor(
+                susceptibility, dtype=dtype
+            ).reshape(1, -1)
+            graph.ground_polarization = torch.tensor([polarization], dtype=dtype)
+            susceptibilities.append(susceptibility)
+            polarizations.append(polarization)
         graphs.append(graph)
         energies.append(energy)
         dipoles.append(dipole)
@@ -74,16 +105,27 @@ def read_tdm_data(
         "tdm": torch.tensor(np.asarray(dipoles), dtype=dtype),
         "osce": torch.tensor(np.asarray(strengths), dtype=dtype),
     }
+    if solvation:
+        targets["susceptibility"] = torch.tensor(
+            np.asarray(susceptibilities), dtype=dtype
+        )
+        targets["ground_polarization"] = torch.tensor(
+            np.asarray(polarizations), dtype=dtype
+        )
     return graphs, targets, atoms_list
 
 
 def batch_targets(batch) -> Dict[str, torch.Tensor]:
     num_graphs = int(batch.ptr.numel() - 1)
-    return {
+    targets = {
         "energy_ex": batch.energy_ex.view(num_graphs, -1),
         "tdm": batch.tdm.view(num_graphs, -1, 3),
         "osce": batch.osce.view(num_graphs, -1),
     }
+    if "susceptibility" in batch:
+        targets["susceptibility"] = batch.susceptibility.view(num_graphs, -1)
+        targets["ground_polarization"] = batch.ground_polarization.view(num_graphs)
+    return targets
 
 
 class CachedFeatures(torch.utils.data.Dataset):
@@ -161,9 +203,14 @@ def regression_report(
     reference directions, never on the signed components.
     """
     report: Dict[str, Dict[str, List[float]]] = {}
-    for key in ("energy_ex", "osce"):
+    for key in ("energy_ex", "osce", "susceptibility", "ground_polarization"):
         if key not in target:
             continue
+        if key not in prediction:
+            continue
+        if target[key].ndim == 1:
+            target = {**target, key: target[key][:, None]}
+            prediction = {**prediction, key: prediction[key][:, None]}
         errors = prediction[key] - target[key]
         report[key] = {
             "mae": np.abs(errors).mean(axis=0).tolist(),

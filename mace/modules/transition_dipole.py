@@ -39,6 +39,22 @@ Equivariance
     the local correction a point-charge picture misses.  Both terms rotate with
     the molecule and are invariant to atom permutation.
 
+Solvation
+    With ``solvation=True`` the head also predicts the two quantities NEMO
+    needs to move an ensemble between solvents without new QM:
+
+    ``susceptibility``  per-state ``d_n = -(ptSS + ptLR PCM correction)``, eV.
+        Like the dipole it is a state property that is exchanged wherever two
+        states cross, so it is predicted as a smooth symmetric *diabatic*
+        matrix ``D`` and rotated with the same eigenvectors:
+        ``d_i = sum_kl U[k, i] D[k, l] U[l, i]``.  That treats ``d`` as a
+        one-body expectation value, which is exact for the diagonal and an
+        approximation for the (quadratic) state-specific term.
+    ``ground_polarization``  ``gp``, one invariant per geometry, eV.
+
+    Solvent interpolation is then ``E(eps, n) = E - alpha(eps)/alpha(n_ref^2) d``
+    with ``alpha(x) = (x - 1)/(x + 1)``; see ``nemo.analysis``.
+
 Phase
     The sign of ``mu_n`` is an arbitrary wavefunction phase and differs between
     single-point calculations, so nothing here -- loss or metric -- may depend
@@ -183,6 +199,7 @@ class TransitionDipoleHead(torch.nn.Module):
         vector_scale: float = 0.1,
         eigh_eps: float = 1.0e-3,
         factorised: bool = True,
+        solvation: bool = False,
     ):
         super().__init__()
         if basis not in {"adiabatic", "diabatic"}:
@@ -219,6 +236,61 @@ class TransitionDipoleHead(torch.nn.Module):
         self.register_buffer("energy_reference", energy_reference.clone())
         self.register_buffer("feature_mean", torch.zeros(scalar_dim))
         self.register_buffer("feature_std", torch.ones(scalar_dim))
+
+        self.solvation = solvation
+        if solvation:
+            self.susceptibility_mlp = _mlp(
+                [2 * hidden_dim, hidden_dim, num_states * (num_states + 1) // 2],
+                dropout,
+            )
+            self.polarization_mlp = _mlp([2 * hidden_dim, hidden_dim, 1], dropout)
+            # outputs are standardised offsets from the training means
+            for mlp in (self.susceptibility_mlp, self.polarization_mlp):
+                torch.nn.init.zeros_(mlp[-1].bias)
+                mlp[-1].weight.data.mul_(0.1)
+            self.register_buffer("susceptibility_mean", torch.zeros(num_states))
+            self.register_buffer("susceptibility_scale", torch.ones(num_states))
+            self.register_buffer("polarization_mean", torch.zeros(()))
+            self.register_buffer("polarization_scale", torch.ones(()))
+
+    def set_solvation_statistics(
+        self, susceptibility: torch.Tensor, polarization: torch.Tensor
+    ) -> None:
+        self.susceptibility_mean.copy_(susceptibility.mean(dim=0))
+        self.susceptibility_scale.copy_(susceptibility.std(dim=0).clamp_min(1.0e-6))
+        self.polarization_mean.copy_(polarization.mean())
+        self.polarization_scale.copy_(polarization.std().clamp_min(1.0e-6))
+
+    def _symmetric(self, entries: torch.Tensor, num_graphs: int) -> torch.Tensor:
+        matrix = entries.new_zeros(num_graphs, self.num_states, self.num_states)
+        matrix[:, self.triu_rows, self.triu_cols] = entries
+        matrix = matrix + matrix.transpose(-1, -2)
+        return matrix - 0.5 * torch.diag_embed(
+            torch.diagonal(matrix, dim1=-2, dim2=-1)
+        )
+
+    def _solvation(
+        self, pooled: torch.Tensor, rotation: torch.Tensor, num_graphs: int
+    ) -> Dict[str, torch.Tensor]:
+        if not self.solvation:
+            return {}
+        scale = self.susceptibility_scale
+        # diabatic matrix in standardised units; the diagonal sits on the mean
+        matrix = self._symmetric(self.susceptibility_mlp(pooled), num_graphs)
+        matrix = scale.sqrt().unsqueeze(-1) * matrix * scale.sqrt().unsqueeze(-2)
+        matrix = matrix + torch.diag_embed(
+            self.susceptibility_mean.expand(num_graphs, -1)
+        )
+        susceptibility = torch.einsum("nki,nkl,nli->ni", rotation, matrix, rotation)
+        polarization = (
+            self.polarization_mlp(pooled).squeeze(-1) * self.polarization_scale
+            + self.polarization_mean
+        )
+        return {
+            "susceptibility": susceptibility,
+            "susceptibility_diabatic": matrix,
+            "ground_polarization": polarization,
+        }
 
     def set_feature_statistics(self, scalars: torch.Tensor) -> None:
         self.feature_mean.copy_(scalars.mean(dim=0))
@@ -283,6 +355,7 @@ class TransitionDipoleHead(torch.nn.Module):
                 num_graphs, -1, -1
             )
             return {
+                **self._solvation(pooled, eye, num_graphs),
                 "tdm": diabatic,
                 "tdm_diabatic": diabatic,
                 "rotation": eye,
@@ -296,17 +369,13 @@ class TransitionDipoleHead(torch.nn.Module):
 
         # smooth symmetric mixing matrix from graph-level invariants
         entries = self.mixing_mlp(pooled) * self.coupling_scale
-        matrix = entries.new_zeros(num_graphs, self.num_states, self.num_states)
-        matrix[:, self.triu_rows, self.triu_cols] = entries
-        matrix = matrix + matrix.transpose(-1, -2)
-        matrix = matrix - 0.5 * torch.diag_embed(
-            torch.diagonal(matrix, dim1=-2, dim2=-1)
-        )
+        matrix = self._symmetric(entries, num_graphs)
         mixing = matrix + torch.diag_embed(self.energy_reference.expand(num_graphs, -1))
 
         values, rotation = safe_eigh(mixing, self.eigh_eps)
         adiabatic = torch.einsum("nki,nka->nia", rotation, diabatic)
         return {
+            **self._solvation(pooled, rotation, num_graphs),
             "tdm": adiabatic,
             "tdm_diabatic": diabatic,
             "rotation": rotation,
@@ -331,6 +400,7 @@ class TransitionDipoleMACE(torch.nn.Module):
         vector_scale: float = 0.1,
         eigh_eps: float = 1.0e-3,
         factorised: bool = True,
+        solvation: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
@@ -350,6 +420,7 @@ class TransitionDipoleMACE(torch.nn.Module):
             vector_scale=vector_scale,
             eigh_eps=eigh_eps,
             factorised=factorised,
+            solvation=solvation,
         )
 
     @property
@@ -384,6 +455,11 @@ class TransitionDipoleMACE(torch.nn.Module):
 
     def set_magnitude_reference(self, dipole: torch.Tensor) -> None:
         self.head.set_magnitude_reference(dipole)
+
+    def set_solvation_statistics(
+        self, susceptibility: torch.Tensor, polarization: torch.Tensor
+    ) -> None:
+        self.head.set_solvation_statistics(susceptibility, polarization)
 
     def forward(
         self,
@@ -447,6 +523,10 @@ class TransitionDipoleLoss(torch.nn.Module):
         energy_weight: float = 1.0,
         strength_weight: float = 0.3,
         total_weight: float = 0.0,
+        susceptibility_std: Optional[torch.Tensor] = None,
+        polarization_std: Optional[torch.Tensor] = None,
+        susceptibility_weight: float = 0.0,
+        polarization_weight: float = 0.0,
     ):
         super().__init__()
         self.register_buffer("dipole_std", dipole_std.clamp_min(1.0e-8))
@@ -458,6 +538,15 @@ class TransitionDipoleLoss(torch.nn.Module):
         self.energy_weight = energy_weight
         self.strength_weight = strength_weight
         self.total_weight = total_weight
+        self.susceptibility_weight = susceptibility_weight
+        self.polarization_weight = polarization_weight
+        if susceptibility_weight > 0.0 or polarization_weight > 0.0:
+            if susceptibility_std is None or polarization_std is None:
+                raise ValueError("solvation weights need solvation statistics")
+            self.register_buffer(
+                "susceptibility_std", susceptibility_std.clamp_min(1.0e-8)
+            )
+            self.register_buffer("polarization_std", polarization_std.clamp_min(1.0e-8))
 
     def forward(
         self,
@@ -495,12 +584,23 @@ class TransitionDipoleLoss(torch.nn.Module):
                 strength.sum(-1) - target["osce"].sum(-1)
             ) / self.strength_std.sum()
             total = total + self.total_weight * total_error.square().mean()
+        if self.susceptibility_weight > 0.0:
+            # d is a real per-state scalar: no phase, plain standardised MSE
+            error = (
+                prediction["susceptibility"] - target["susceptibility"]
+            ) / self.susceptibility_std
+            total = total + self.susceptibility_weight * error.square().mean()
+        if self.polarization_weight > 0.0:
+            error = (
+                prediction["ground_polarization"] - target["ground_polarization"]
+            ) / self.polarization_std
+            total = total + self.polarization_weight * error.square().mean()
         return total
 
 
 def target_statistics(targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     dipole = targets["tdm"]
-    return {
+    statistics = {
         "energy_reference": targets["energy_ex"].mean(dim=0),
         "energy_std": targets["energy_ex"].std(dim=0),
         # RMS rather than std: the sign is arbitrary so the mean is meaningless
@@ -508,3 +608,7 @@ def target_statistics(targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tenso
         "tensor_std": intensity_tensor(dipole).flatten(2).std(dim=(0, 2)),
         "strength_std": targets["osce"].std(dim=0),
     }
+    if "susceptibility" in targets:
+        statistics["susceptibility_std"] = targets["susceptibility"].std(dim=0)
+        statistics["polarization_std"] = targets["ground_polarization"].std()
+    return statistics

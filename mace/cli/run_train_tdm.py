@@ -68,6 +68,14 @@ def parse_args() -> argparse.Namespace:
         help="weight on the summed-intensity term; measured to hurt both "
         "per-state f and the sum itself, so it is off by default",
     )
+    parser.add_argument(
+        "--solvation",
+        action="store_true",
+        help="also predict the NEMO susceptibilities REF_susceptibility and "
+        "the ground-state polarization REF_gp used for solvent interpolation",
+    )
+    parser.add_argument("--susceptibility-weight", type=float, default=1.0)
+    parser.add_argument("--polarization-weight", type=float, default=1.0)
     parser.add_argument("--coupling-scale", type=float, default=0.2)
     parser.add_argument("--charge-scale", type=float, default=1.0)
     parser.add_argument("--vector-scale", type=float, default=1.0)
@@ -120,7 +128,9 @@ def evaluate_cached(model, loader, loss_fn, device):
 @torch.no_grad()
 def predict(model, loader, device):
     model.eval()
-    keys = ("energy_ex", "tdm")
+    keys = ["energy_ex", "tdm"]
+    if model.head.solvation:
+        keys += ["susceptibility", "ground_polarization"]
     collected = {key: [] for key in keys}
     reference = {key: [] for key in keys}
     for batch in loader:
@@ -154,11 +164,13 @@ def main() -> None:
     backbone = load_foundation_model(
         args.foundation_model, args.device, getattr(torch, args.dtype)
     )
-    graphs, targets, _ = read_tdm_data(args.train_file, backbone, args.num_states)
+    graphs, targets, _ = read_tdm_data(
+        args.train_file, backbone, args.num_states, solvation=args.solvation
+    )
     if args.valid_file:
         train_graphs, train_targets = graphs, targets
         valid_graphs, valid_targets, _ = read_tdm_data(
-            args.valid_file, backbone, args.num_states
+            args.valid_file, backbone, args.num_states, solvation=args.solvation
         )
     else:
         train_indices, valid_indices = split_indices(
@@ -182,8 +194,14 @@ def main() -> None:
         vector_scale=args.vector_scale,
         eigh_eps=args.eigh_eps,
         factorised=not args.direct_dipole,
+        solvation=args.solvation,
     ).to(args.device)
     model.set_magnitude_reference(train_targets["tdm"].to(args.device))
+    if args.solvation:
+        model.set_solvation_statistics(
+            train_targets["susceptibility"].to(args.device),
+            train_targets["ground_polarization"].to(args.device),
+        )
     energy_weight = 0.0 if args.basis == "adiabatic" else args.energy_weight
     loss_fn = TransitionDipoleLoss(
         dipole_std=statistics["dipole_std"],
@@ -195,6 +213,10 @@ def main() -> None:
         energy_weight=energy_weight,
         strength_weight=args.strength_weight,
         total_weight=args.total_weight,
+        susceptibility_std=statistics.get("susceptibility_std"),
+        polarization_std=statistics.get("polarization_std"),
+        susceptibility_weight=args.susceptibility_weight if args.solvation else 0.0,
+        polarization_weight=args.polarization_weight if args.solvation else 0.0,
     ).to(args.device)
 
     model.set_backbone_trainable("head")
@@ -343,6 +365,7 @@ def main() -> None:
             "vector_scale": args.vector_scale,
             "eigh_eps": args.eigh_eps,
             "factorised": not args.direct_dipole,
+            "solvation": args.solvation,
             "energy_reference": statistics["energy_reference"].cpu(),
             "dtype": args.dtype,
             "metrics": metrics,

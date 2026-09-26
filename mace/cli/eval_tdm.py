@@ -78,25 +78,37 @@ def main() -> None:
         vector_scale=checkpoint["vector_scale"],
         eigh_eps=checkpoint["eigh_eps"],
         factorised=checkpoint.get("factorised", True),
+        solvation=checkpoint.get("solvation", False),
     ).to(args.device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
     num_states = checkpoint["num_states"]
+    solvation = checkpoint.get("solvation", False)
     graphs, targets, atoms_list = read_tdm_data(
-        args.configs, backbone, num_states, require_targets=not args.no_targets
+        args.configs,
+        backbone,
+        num_states,
+        require_targets=not args.no_targets,
+        solvation=solvation,
     )
     loader = make_loader(graphs, args.batch_size, False)
 
-    dipoles, energies = [], []
+    dipoles, energies, susceptibilities, polarizations = [], [], [], []
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(args.device)
             prediction = model(batch.to_dict())
             dipoles.append(prediction["tdm"].cpu().numpy())
             energies.append(prediction["energy_ex"].cpu().numpy())
+            if solvation:
+                susceptibilities.append(prediction["susceptibility"].cpu().numpy())
+                polarizations.append(prediction["ground_polarization"].cpu().numpy())
     dipoles = np.concatenate(dipoles)
     model_energies = np.concatenate(energies)
+    if solvation:
+        susceptibilities = np.concatenate(susceptibilities)
+        polarizations = np.concatenate(polarizations)
 
     if args.energy_source == "model":
         used_energies = model_energies
@@ -133,6 +145,9 @@ def main() -> None:
         atoms.info["MACE_tdm"] = dipoles[index].reshape(-1)
         atoms.info["MACE_energy_ex"] = model_energies[index]
         atoms.info["MACE_osce"] = strengths[index]
+        if solvation:
+            atoms.info["MACE_susceptibility"] = susceptibilities[index]
+            atoms.info["MACE_gp"] = float(polarizations[index])
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     write(args.output, atoms_list, format="extxyz")
 
@@ -146,6 +161,9 @@ def main() -> None:
         "energy_ex": model_energies,
         "osce": strengths,
     }
+    if solvation:
+        prediction["susceptibility"] = susceptibilities
+        prediction["ground_polarization"] = polarizations
     metrics = regression_report(reference, prediction)
     metrics["energy_source"] = args.energy_source
     print(json.dumps(metrics, indent=2))
