@@ -1,220 +1,178 @@
-# Predicting oscillator strengths through the transition dipole
+# Excited-state model: transition dipoles, energies and spin-orbit couplings
+
+`mace.modules.transition_dipole.TransitionDipoleMACE` is a pretrained MACE
+backbone with an equivariant head that predicts, for one geometry,
+
+| quantity | symbol | how |
+| --- | --- | --- |
+| singlet excitation energies | `E_S` | eigenvalues of a smooth mixing matrix `H_S` |
+| transition dipoles `<S0|mu|S_n>` | `mu` | diabatic polar vectors rotated by `eigh(H_S)` |
+| oscillator strengths | `f = 2/3 dE[Ha] |mu|^2` | derived, never regressed |
+| triplet excitation energies | `E_T` | eigenvalues of a second mixing matrix `H_T` |
+| spin-orbit couplings `|<S_m|H_SO|T_k>|`, m = 0..nS | `soc` | diabatic axial vectors rotated by both manifolds |
+
+Labels a database does not have are NaN and drop out of every loss and
+metric, so one model definition and one command serve the S0, S1 and T1
+ensembles.
 
 ## Why not regress `f` directly
 
-The oscillator strength is a derived quantity:
-
-```
-f_n = 2/3 * dE_n[Hartree] * |mu_n|^2
-```
-
-Checked against every geometry in the DiKTA ensemble, this reproduces the
-`osce_s*` columns to `2e-5`, so nothing is lost by predicting `(dE, mu)`
-instead of `f`. Three things are gained: `mu` is a vector, so the equivariant
-part of the backbone gets used instead of discarded; it carries three numbers
-per state rather than one; and the state mixing that makes `f` discontinuous
-acts on `mu` linearly, so it can be represented exactly.
-
-The discontinuity is the real problem. In this ensemble the S1-S2 gap reaches
-0.005 eV, 14% of geometries sit below 0.05 eV, and the bright HOMO->LUMO
-configuration is the dominant character of adiabatic S1 in 725/1000 geometries
-but of adiabatic S2 in 356/1000. The two adiabatic labels exchange intensity
-(`corr(f_S1, f_S2) = -0.886`). `f_S1(R)` therefore has genuine steps, and no
-smooth regressor can fit it.
+The oscillator strength is a derived quantity: `f_n = 2/3 dE_n[Hartree] |mu_n|^2`
+holds for every geometry in the DiKTA ensembles to `2e-5`. Predicting `(dE, mu)`
+uses the equivariant part of the backbone instead of discarding it, carries
+three numbers per state instead of one, and lets the state mixing that makes
+`f` discontinuous act linearly on `mu`, where it can be represented exactly.
+Adiabatic labels exchange intensity wherever two states approach (14% of the
+S1-ensemble geometries have an S1-S2 gap below 0.05 eV), so `f_S1(R)` has
+genuine steps that no smooth regressor can fit.
 
 ## The model
 
-`mace.modules.transition_dipole.TransitionDipoleMACE` is a MACE backbone with a
-`TransitionDipoleHead` on top. MACE rather than X-MACE: MACE-OFF supplies a
-pretrained organic backbone whose first interaction layer already exposes 128
-`1o` channels, which is exactly how a polar vector transforms.
+### Backbone
 
-The dipole is built from two terms, both translation invariant, rotation
-equivariant and permutation invariant:
+Any MACE backbone whose product blocks expose `linear.irreps_out` works:
 
-* **transition charges** `q_i` constrained to `sum_i q_i = 0`, contracted with
-  the atom positions -- the standard transition-charge ansatz, which carries
-  the long-range part;
-* a learned contraction of the backbone `1o` node features, the local
-  correction a point-charge picture misses.
+| `--foundation-model` | channels (layer 1) | note |
+| --- | --- | --- |
+| `medium_off` (also `small_off`, `large_off`) | 128x0e + 128x1o | MACE-OFF23, organic only |
+| `mh-1` (default; also `mh-0`) | 512x0e + 512x1o | MACE-MH multi-head (omol, spice heads) |
+| `omol` | 1024 channels | MACE-OMOL extra large, 420 MB, ASL licence |
+| a `.model` path | | any pickled MACE module |
 
-By default the result is **factorised** into an invariant magnitude and a unit
-direction, `mu = m(invariants) * u_hat`. `|mu|` is a rotational invariant, so
-reading it off the invariant features directly stops direction error from
-leaking into the magnitude -- and `|mu|^2` is what `f` uses. Pass
-`--direct-dipole` to take the raw vector instead.
+The head reads the invariant (`0e` and norms of `l > 0`) channels and the
+`1o` channels of every layer. The `1o` channels pass through an equivariant
+channel mixing (`--vector-dim`, default 32) so the vector readouts stay small
+whatever the backbone width.
 
-### Bases
+### Manifolds and the diabatic basis (`--basis diabatic`, default)
 
-`--basis diabatic` (default)
-: The head also predicts a smooth symmetric mixing matrix `H`. Diagonalising it
-  gives the adiabatic rotation and, as a by-product, the excitation energies:
+Each spin manifold has a smooth symmetric mixing matrix built in standardised
+units: diagonal entries are `E_ref + sigma_E * output` per state, off-diagonal
+couplings are in units of the mean `sigma_E`, both taken from the training
+labels. Diagonalising it gives the energies and the rotation `U` that turns
+smooth diabatic state properties into the discontinuous adiabatic ones:
 
-  ```
-  E, U = eigh(H)
-  mu_i = sum_k U[k, i] mu_d[k]
-  ```
+```
+E, U = eigh(H)          mu_i = sum_k U[k, i] mu_d[k]
+```
 
-  Everything the network emits is smooth in the nuclear coordinates; the
-  eigendecomposition manufactures the non-smooth adiabatic labelling the same
-  way the physics does.
+`safe_eigh` clamps the `1/(lambda_j - lambda_i)` factor of the eigenvector
+gradient (`--eigh-eps`, 1 meV, the only physical constant in the head).
+`--basis adiabatic` regresses energies directly and predicts adiabatic
+properties without a rotation; it is the control.
 
-`--basis adiabatic`
-: One vector per adiabatic state, predicted directly. Simpler, and a useful
-  control, but it inherits the discontinuity.
+### Vectors: magnitude x direction
+
+Polar vectors (dipoles) are transition charges with zero net charge times
+centroid-relative positions plus a contraction of the `1o` features. Axial
+vectors (spin-orbit couplings: `<S|H_SO|T_a>` is `i` times a real axial vector
+in the Cartesian sublevel basis) are cross products of such contractions.
+Both are factorised as `v = m(invariants) * v_hat`: `|v|` is a rotational
+invariant, so it is read from the invariant features and direction error
+never reaches `|mu|^2` or `|SOC|`. Dipole magnitudes are multiples of the
+training RMS; SOC magnitudes are log-normal around the training log-mean
+because they span decades. `--direct-dipole` disables the factorisation
+(ablation: it then fails to fit even the training set).
+
+### Spin-orbit couplings
+
+`--num-triplets N` adds the triplet manifold and the SOC head for the block
+`(S_0..S_nS) x (T_1..T_N)`. Two modes:
+
+* `--soc-mode diabatic` (default): diabatic axial vectors `V[m, k]`, rotated
+  `U_S0^T V U_T` with `S_0` unrotated; `|SOC| = |V_adiabatic|`. The
+  Frobenius norm of the block is a diabatic invariant (unit-tested).
+* `--soc-mode direct`: one invariant log-magnitude per pair, no rotation.
+  The earlier per-target regression baseline.
+
+Both are supervised in log space, NaN-masked. In `diabatic` mode the vectors
+themselves are also supervised (`--soc-vector-weight`, sign-matched like the
+dipoles) against `REF_soc_vec`: the Q-Chem sublevel components
+`<S|H_SO|T,m_s>` converted to the real Cartesian axial vector with
+`V_x = (c_-1 + c_+1)/sqrt2`, `V_y = i(c_-1 - c_+1)/sqrt2`, `V_z = c_0` (Q-Chem's
+sublevel convention has no Condon-Shortley sign; `V = iW` with `W` real to
+machine precision, and `|W|` equals the root-sum-square magnitude).
+
+Log-fitted magnitudes estimate a geometric mean while rates integrate the
+arithmetic one, so `--calibrate mean` (default) rescales every SOC pair and
+`osce_t` state to the training-set mean ratio after training, with 3-MAD
+outlier rejection; the factors are stored in the checkpoint.
+
+### Auxiliary branch: solvation and phosphorescence
+
+`--solvation` predicts the PCM susceptibilities `d_n` of both manifolds and the
+ground-state polarization `gp`. The susceptibilities are rotated as a diabatic
+matrix, `d_i = (U^T D U)_ii`, with `D = B B^T` positive semi-definite
+(`B = sqrt(mean d) (I + A)`, `A` from the network), so every `d_i >= 0`: a
+negative `d` makes NEMO's reorganisation width `sqrt(2 lambda kT + kT^2)` NaN
+and NEMO then drops the affected rate channel silently; `--phosphorescence` predicts the corrected
+`T_n -> S0` strengths `REF_osce_t` as a log-normal magnitude. Both live on a
+separate atom trunk and receive the manifold rotations *detached*, so their
+losses cannot move any parameter that energies, dipoles or couplings depend on
+(unit-tested: zero gradient on every main parameter). The main outputs are
+therefore identical with or without them.
+
+### Fine-tuning
+
+`--fine-tune head|last|full` with `--fine-tune-layers N` (how many interaction
+and product blocks from the top train in `last` mode).
 
 ### Phase
 
-The sign of `mu_n` is an arbitrary wavefunction phase: 48.6% of the geometries
-in this ensemble have `mu_S1` anti-aligned with the ensemble mean direction.
-Nothing -- loss or metric -- may depend on it.
+The sign of `mu_n` is an arbitrary wavefunction phase (48.6% of the DiKTA S1
+dipoles are anti-aligned with the ensemble mean). The loss uses
+`phase_matched_error`, `sign(mu_pred . mu_ref) * mu_ref`, which is phase free
+and quadratic; `mu mu^T` is quartic, puts a zero-gradient saddle at `mu = 0`,
+and is kept only as a supporting term (`--tensor-weight`). Metrics are `|mu|^2`
+and `|cos|`, never signed components.
 
-The loss is therefore built on `phase_matched_error`, which compares against
-`sign(mu_pred . mu_ref) * mu_ref`. This is phase free *and quadratic*. The
-other obvious phase-free choice, `mu mu^T`, is quartic, which makes `mu = 0` a
-critical point with vanishing gradient; a head initialised near zero never
-leaves it, and trains to a direction accuracy below that of a constant vector.
-`mu mu^T` is kept as a supporting term (`--tensor-weight`), never alone.
+## Data
 
-Metrics follow the same rule: `|mu|^2` and `|cos|`, never signed components.
+`db2xyz.py` in each `dikta-*` directory writes, per configuration:
 
-### Near-degeneracies
+```
+REF_energy_ex  REF_tdm  REF_osce            singlets (xtraee parse)
+REF_energy_t                                triplets (logs, else NEMO e_t*)
+REF_soc  REF_soc_shape  REF_soc_vec         |SOC| block (n_S+1, n_T) and Cartesian vectors, eV
+REF_osce_t                                  T_k -> S0 strengths, corrected second-order sum
+REF_d_s  REF_d_t  REF_gp                    (--solvation) PCM susceptibilities and gp, eV
+```
 
-`safe_eigh` clamps the `1 / (lambda_j - lambda_i)` factor in the eigenvector
-gradient. Without it the gradient diverges exactly where two states approach
-each other, which is the regime the diabatic basis exists to handle. There is a
-unit test asserting the clamped gradient is finite on a degenerate matrix where
-`torch.linalg.eigh` returns NaN, and that it matches autograd away from
-degeneracy.
+`gather_data.py --update-from-logs DIR` adds `e_t_parsed`, `soc_rss`, `soc_vec`
+and `osce_t_corrected` from `Geometry-N-.log` to an existing database. The
+magnitudes agree with NEMO's `soc_*` columns to 1e-3 relative. The strengths
+do **not** agree with NEMO's `osce_t*` columns: NEMO's `moment()` broadcast a
+column of couplings against a row of dipoles, summing
+`(sum_k SOC_k)(sum_j mu_j/E_j)` instead of `sum_k SOC_k mu_k/E_k`, and used
+`<T1|H|S0>` for every `T_n`. Both are fixed in the local NEMO clone
+(`nemo/parser.py`, `nemo/eom.py`); the fixed code and `borrowed_strengths`
+agree to four digits, and the corrected `f_T1` is about three orders of
+magnitude smaller than the released columns.
 
 ## Pipeline
 
 ```bash
-./workflow.sh
+cd dikta-s1                 # or dikta-s0, dikta-t1: the scripts are identical
+./workflow.sh               # db -> extxyz -> train -> eval -> plots
+FOUNDATION=medium_off TAG=s1-off ./train_tdm.sh      # another backbone
+NUM_TRIPLETS=0 ./train_tdm.sh                        # singlets only
+SOC_MODE=direct ./train_tdm.sh
 ```
 
-runs the four steps individually available as:
+`eval_tdm --energy-source model|reference|info` chooses the energies that
+enter `f`; `reference` isolates the dipole error.
 
-```bash
-# 1. QChem TDDFT logs -> ASE database, via the xtraee parser
-venv/bin/python gather_data.py Dikta --db=s1/geometries.db --state=s1
+`nemo_solvents.py <prefix> <out> --state s0|s1|t1 [--solvent NAME:EPS:NR ...]`
+(in each `dikta-*` directory) builds NEMO ensemble tables from the evaluated
+files, one from the TDDFT labels and one from the model outputs, and runs
+`nemo.analysis.rates` / `nemo.analysis.absorption` on both for every solvent:
+radiative and ISC rates, peak positions and spectra with NEMO's own solvent
+interpolation. It needs the local NEMO clone installed (`pip install -e
+osce_predict_mace/NEMO`, plus `LeoX`, `joblib`, `requests`, `tabulate`).
 
-# 2. database -> extxyz with REF_tdm / REF_energy_ex / REF_osce
-venv/bin/python db2xyz.py s1/geometries.db s1/dikta s1 --num-states 3
+## Checkpoints
 
-# 3. train
-./train_tdm.sh
-
-# 4. evaluate
-venv/bin/python -m mace.cli.eval_tdm \
-  --model s1/tdm-s1.model \
-  --configs s1/dikta_test.xyz \
-  --output s1/dikta_test_eval.xyz \
-  --energy-source model
-```
-
-`--energy-source` selects where the energies in `f` come from: `model` (the
-mixing-matrix eigenvalues), `info --energy-key XMACE_energy_ex` (energies
-written into the configurations by another model), or `reference`, which uses
-the TDDFT values and so isolates the error contributed by the dipole alone.
-
-## Results
-
-Held-out test split (200 geometries), model selected on the validation split
-(100), trained on 700. Diabatic basis, factorised dipole, MACE-OFF medium
-backbone:
-
-| | S1 | S2 | S3 |
-| --- | --- | --- | --- |
-| oscillator strength `f` | **0.856** | **0.869** | 0.189 |
-| `\|mu\|^2` | 0.852 | 0.872 | 0.195 |
-| excitation energy `E` | 0.940 | 0.933 | 0.949 |
-
-S3 is weak because it carries almost no intensity (mean `f_S3 = 0.0085`, two
-orders of magnitude below S1), so there is little signal to fit.
-
-### Why this beats the smooth-regression ceiling
-
-Kernel ridge on inverse interatomic distances -- a strong baseline for
-*smoothly regressing the target as a function of geometry* -- tops out at:
-
-| target | KRR test R2 |
-| --- | --- |
-| `f_S1` | 0.318 |
-| `f_S1 + f_S2` | 0.489 |
-| `f_S1 + f_S2 + f_S3` | 0.858 |
-| `\|mu_S1\|^2` | 0.311 |
-| `E_S1` | 0.638 |
-
-The diabatic model is not doing smooth regression of `f`. It regresses a smooth
-mixing matrix and smooth diabatic dipoles, and the eigendecomposition generates
-the discontinuity, so it can represent a target the smooth ceiling forbids. The
-energies show the same pattern: 0.638 regressed directly, 0.94 as eigenvalues
-of the learned matrix.
-
-### Ablations
-
-Same split, same backbone, `hidden_dim=64`, `weight_decay=1e-3`:
-
-| basis | factorised | **train** `\|mu_S1\|^2` | test `f_S1` | test `f_S2` | test `f_S3` | test `E_S1` |
-| --- | --- | --- | --- | --- | --- | --- |
-| diabatic | yes | 0.97 | **0.856** | **0.869** | 0.189 | **0.940** |
-| diabatic | no | 0.23 | -1.776 | 0.103 | -0.022 | 0.875 |
-| adiabatic | yes | 0.96 | 0.656 | 0.686 | **0.427** | n/a |
-
-**Factorisation is the dominant effect.** Without it the head cannot even fit
-its own training set (`|mu_S1|^2` train R2 = 0.23; an unregularised 512-wide
-version reaches only 0.46 after 3000 epochs). The bottleneck is arithmetic, not
-capacity: the intensity has to squeeze through three pooled vector components,
-and component errors compound when squared. Reading the magnitude off the
-invariant features instead lifts `f_S1` from -1.78 to 0.856. Direction accuracy
-stays modest either way (`|cos| ~ 0.73`), which is exactly the point -- once
-the magnitude is factored out, direction error no longer reaches `f`.
-
-**The diabatic basis is a real but smaller second effect**, worth about +0.20
-on `f_S1` and `f_S2` on top of factorisation, and it is the only route to
-excitation energies (0.94 against nothing in the adiabatic head, where the
-energies are a fixed reference). `f_S3` moves the other way -- 0.427 adiabatic
-against 0.189 diabatic -- because S3 barely mixes, so the three-state rotation
-mostly injects noise into it. If S3 matters for an application, train it in the
-adiabatic basis separately.
-
-Note that the adiabatic head fits the training set perfectly well (0.96). The
-discontinuity of the adiabatic labelling is what limits *generalisation* here,
-not trainability.
-
-### Selecting between configurations
-
-Validation losses are **not comparable across bases**: the diabatic loss
-carries an energy term the adiabatic loss does not, so the adiabatic runs post
-a lower number (0.504) while being clearly worse on `f` (0.642 against 0.856).
-Compare within a basis, or on a shared metric such as validation `f` R2.
-
-### What did not work
-
-Supervising the summed intensity directly (`--total-weight 0.3`) was tried
-because `sum(f)` comes out at 0.804, below the 0.858 that kernel ridge reaches
-on that quantity. It made everything worse, including the sum:
-
-| | per-state `f` | `sum(f)` | `E` |
-| --- | --- | --- | --- |
-| default | 0.873 / 0.874 / 0.605 | **0.804** | 0.945 / 0.935 / 0.955 |
-| `--total-weight 0.3` | 0.816 / 0.824 / 0.441 | 0.659 | 0.937 / 0.932 / 0.939 |
-
-`sum(f)` is a function of predictions the per-state terms already constrain, so
-the term carries no new information and only tilts the objective towards a
-coarser target. The flag is kept, defaulting to 0, so the experiment can be
-repeated.
-
-## Caveats
-
-`f_S3` is near the noise floor of this dataset: test R2 came out at 0.189 in
-one configuration and 0.605 in another differing only in optimiser schedule.
-Mean `f_S3` is 0.0085, two orders of magnitude below S1. Do not quote a single
-number for it without repeated seeds. And the split between S1 and S2
-remains the sensitive quantity: it is set by the near-degenerate energy
-ordering, which is why energies and dipoles are predicted from one shared
-mixing matrix rather than by two independent models.
-
-For a nuclear-ensemble spectrum the per-state assignment cancels anyway -- the
-spectrum needs the `(E, f)` pairs summed over states.
+Version 2 checkpoints store the constructor options and the training
+arguments; models trained with the earlier head (`checkpoint_version` 1,
+fixed 0.2 eV coupling scale, MACE-OFF only) are refused by `eval_tdm` and
+must be retrained.

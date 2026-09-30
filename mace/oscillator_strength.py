@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -13,20 +14,61 @@ from mace.modules.oscillator import OscillatorStrengthMACE
 from mace.tools import AtomicNumberTable, torch_geometric
 
 
+FOUNDATION_MODELS = {
+    # MACE-OFF23: organic molecules, wB97M-D3(BJ)/def2-TZVPPD
+    "small_off": ("off", "small"),
+    "medium_off": ("off", "medium"),
+    "large_off": ("off", "large"),
+    # MACE-MH: multi-head foundation models (includes omol and spice heads)
+    "mh-0": ("mp", "mh-0"),
+    "mh-1": ("mp", "mh-1"),
+    # MACE-OMOL: OMol25, wB97M-V/def2-TZVPD, 1024 channels (large download, ASL)
+    "omol": ("omol", "extra_large"),
+    "omol-extra-large": ("omol", "extra_large"),
+}
+
+
 def load_foundation_model(
     model: str,
     device: str,
     dtype: torch.dtype,
 ) -> torch.nn.Module:
-    model_name = model.removesuffix("_off")
-    if model_name in {"small", "medium", "large"}:
-        backbone = mace_off(
-            model=model_name,
-            device=device,
-            return_raw_model=True,
-        )
-    else:
-        backbone = torch.load(model, map_location=device, weights_only=False)
+    """Load a pretrained MACE backbone by name or from a file.
+
+    Names: ``small_off``/``medium_off``/``large_off`` (MACE-OFF23), ``mh-0``/
+    ``mh-1`` (MACE-MH), ``omol`` (MACE-OMOL extra large), any other MACE-MP
+    release name, or a path to a ``.model`` file.  The checkpoints are pickled
+    modules, so they are loaded with ``weights_only=False``; that is what
+    ``TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD`` used to be set for.
+    """
+    from mace.calculators import mace_mp, mace_omol
+    from mace.calculators.foundations_models import mace_mp_urls
+
+    previous = os.environ.get("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD")
+    os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+    try:
+        name = model.removesuffix("_off") if model.endswith("_off") else model
+        family, key = FOUNDATION_MODELS.get(model, (None, None))
+        if family == "off" or model in {"small", "medium", "large"}:
+            backbone = mace_off(model=key or name, device=device, return_raw_model=True)
+        elif family == "mp" or model in mace_mp_urls:
+            backbone = mace_mp(model=key or model, device=device, return_raw_model=True)
+        elif family == "omol":
+            backbone = mace_omol(model=key, device=device, return_raw_model=True)
+        elif os.path.isfile(model):
+            backbone = torch.load(model, map_location=device, weights_only=False)
+        else:
+            raise ValueError(
+                f"unknown foundation model {model!r}; use one of "
+                f"{sorted(FOUNDATION_MODELS)}, a MACE-MP release name or a file path"
+            )
+    finally:
+        if previous is None:
+            os.environ.pop("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", None)
+        else:
+            os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = previous
+    if isinstance(backbone, torch.jit.ScriptModule):
+        raise TypeError(f"{model!r} is a TorchScript module; a pickled MACE module is needed")
     return backbone.to(device=device, dtype=dtype)
 
 
