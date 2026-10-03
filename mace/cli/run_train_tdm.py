@@ -51,7 +51,7 @@ from mace.transition_dipole_data import (
 )
 
 CHECKPOINT_VERSION = 2
-PREDICTION_KEYS = ("energy_ex", "tdm", "energy_t", "soc", "soc_vectors", "osce_t",
+PREDICTION_KEYS = ("energy_ex", "tdm", "energy_t", "soc", "soc_vectors", "tdm_t", "osce_t",
                    "susceptibility_s", "susceptibility_t", "ground_polarization")
 TARGET_OF = {"soc_vectors": "soc_vec", "susceptibility_s": "d_s", "susceptibility_t": "d_t",
              "ground_polarization": "gp"}
@@ -139,10 +139,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--phosphorescence",
         action="store_true",
-        help="predict the T_n -> S0 strengths REF_osce_t (log fit, mean-calibrated) on "
-        "the detached auxiliary branch",
+        help="derive the T_n -> S0 strengths REF_osce_t from predicted energies, "
+        "coherent SOC vectors, and singlet/ground/triplet dipoles",
     )
     parser.add_argument("--phosphorescence-weight", type=float, default=1.0)
+    parser.add_argument("--triplet-dipole-weight", type=float, default=1.0)
     parser.add_argument(
         "--calibrate",
         choices=["none", "mean"],
@@ -263,11 +264,17 @@ def model_options(args) -> dict:
         "soc_mode": args.soc_mode,
         "solvation": args.solvation,
         "phosphorescence": args.phosphorescence,
+        "derived_phosphorescence": args.phosphorescence,
     }
 
 
 def main() -> None:
     args = parse_args()
+    if args.phosphorescence and args.soc_mode != "diabatic":
+        raise ValueError(
+            "--phosphorescence now derives osce_t from coherent SOC vectors; "
+            "use --soc-mode diabatic"
+        )
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
     random.seed(args.seed)
@@ -282,6 +289,18 @@ def main() -> None:
     graphs, targets, _ = read_tdm_data(
         args.train_file, backbone, args.num_states, args.num_triplets
     )
+    if args.phosphorescence:
+        missing = [
+            key
+            for key in ("energy_t", "soc_vec", "tdm_t", "osce_t")
+            if key not in targets or not bool(torch.isfinite(targets[key]).all())
+        ]
+        if missing:
+            raise ValueError(
+                "derived phosphorescence needs complete "
+                f"{missing} labels; rerun the dikta gather_data.py "
+                "--update-from-logs step and rebuild the extxyz files"
+            )
     if args.valid_file:
         train_graphs, train_targets = graphs, targets
         valid_graphs, valid_targets, _ = read_tdm_data(
@@ -315,6 +334,7 @@ def main() -> None:
         triplet_energy_weight=args.triplet_energy_weight,
         soc_weight=args.soc_weight,
         soc_vector_weight=args.soc_vector_weight if args.soc_mode == "diabatic" else 0.0,
+        triplet_dipole_weight=args.triplet_dipole_weight if args.phosphorescence else 0.0,
         phosphorescence_weight=args.phosphorescence_weight if args.phosphorescence else 0.0,
         solvation_weight=args.solvation_weight if args.solvation else 0.0,
     ).to(args.device)

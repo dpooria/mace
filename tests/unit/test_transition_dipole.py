@@ -11,6 +11,7 @@ from mace.modules.transition_dipole import (
     HARTREE_PER_EV,
     TransitionDipoleMACE,
     oscillator_strength,
+    phosphorescence_oscillator_strength,
     safe_eigh,
 )
 from mace.oscillator_strength import load_foundation_model
@@ -157,6 +158,46 @@ def test_oscillator_strength_matches_definition():
     assert oscillator_strength(dipole, energy).item() == pytest.approx(
         0.1869656307, abs=2e-5
     )
+
+
+def test_phosphorescence_strength_matches_explicit_nemo_sum():
+    dtype = torch.float64
+    mu_s = torch.tensor([[[0.3, -0.2, 0.1], [0.1, 0.4, -0.3]]], dtype=dtype)
+    mu_t = torch.tensor(
+        [[[[0.6, 0.1, -0.2], [0.2, -0.3, 0.4]],
+          [[0.2, -0.3, 0.4], [-0.1, 0.7, 0.2]]]], dtype=dtype
+    )
+    e_s = torch.tensor([[2.2, 3.1]], dtype=dtype)
+    e_t = torch.tensor([[1.4, 2.6]], dtype=dtype)
+    soc = torch.tensor(
+        [[[[0.010, -0.020, 0.015], [0.006, 0.004, -0.003]],
+          [[0.020, 0.010, -0.005], [0.008, -0.006, 0.004]],
+          [[-0.007, 0.009, 0.003], [0.012, 0.005, -0.011]]]], dtype=dtype
+    )
+    actual = phosphorescence_oscillator_strength(mu_s, mu_t, e_s, e_t, soc)
+    expected = torch.zeros_like(e_t)
+    for n in range(e_t.shape[1]):
+        effective = torch.zeros(3, 3, dtype=dtype)
+        for k in range(e_t.shape[1]):
+            effective += torch.outer(soc[0, 0, k] / -e_t[0, k], mu_t[0, n, k])
+        for m in range(e_s.shape[1]):
+            effective += torch.outer(
+                soc[0, m + 1, n] / (e_t[0, n] - e_s[0, m]), mu_s[0, m]
+            )
+        expected[0, n] = (2.0 / 3.0) * e_t[0, n] * HARTREE_PER_EV * effective.square().sum()
+    assert torch.allclose(actual, expected, atol=1.0e-15, rtol=1.0e-13)
+
+
+def test_derived_phosphorescence_requires_vector_soc(backbone):
+    with pytest.raises(ValueError, match="soc_mode='diabatic'"):
+        TransitionDipoleMACE(
+            backbone=backbone,
+            num_states=NUM_STATES,
+            num_triplets=2,
+            soc_mode="direct",
+            phosphorescence=True,
+            derived_phosphorescence=True,
+        )
 
 
 def test_safe_eigh_gradient_is_finite_at_degeneracy():

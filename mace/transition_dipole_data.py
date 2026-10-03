@@ -9,6 +9,7 @@ Per configuration the extxyz ``atoms.info`` may carry
     REF_soc         |<S_m|H_SO|T_k>|, eV, flattened (n_S + 1, n_T)  optional
     REF_soc_shape   the two dimensions of REF_soc                    with REF_soc
     REF_soc_vec     the couplings as Cartesian axial vectors, (n_S + 1, n_T, 3)  optional
+    REF_tdm_t       symmetric triplet dipoles <T_i|mu|T_j>, a.u., (n_T,n_T,3) optional
     REF_osce_t      T_k -> S0 strengths, (n_T,)                      optional
     REF_d_s, REF_d_t, REF_gp   PCM susceptibilities and ground-state polarization, eV, optional
 
@@ -87,7 +88,8 @@ def read_tdm_data(
     graphs: List[data.AtomicData] = []
     collected: Dict[str, list] = {
         key: [] for key in
-        ("energy_ex", "tdm", "osce", "energy_t", "soc", "soc_vec", "osce_t", "d_s", "d_t", "gp")
+        ("energy_ex", "tdm", "osce", "energy_t", "soc", "soc_vec", "tdm_t",
+         "osce_t", "d_s", "d_t", "gp")
     }
     for index, atoms in enumerate(atoms_list):
         if require_targets:
@@ -118,6 +120,7 @@ def read_tdm_data(
         osce_t = np.full(max(num_triplets, 0), np.nan)
         soc = np.full((num_states + 1, max(num_triplets, 0)), np.nan)
         soc_vec = np.full((num_states + 1, max(num_triplets, 0), 3), np.nan)
+        tdm_t = np.full((max(num_triplets, 0), max(num_triplets, 0), 3), np.nan)
         d_s = _optional(atoms, "REF_d_s", num_states)
         d_t = _optional(atoms, "REF_d_t", max(num_triplets, 0))
         gp = float(np.asarray(atoms.info.get("REF_gp", np.nan), float).reshape(-1)[0])
@@ -130,6 +133,15 @@ def read_tdm_data(
             osce_t = _optional(atoms, "REF_osce_t", num_triplets)
             soc = _soc_matrix(atoms, num_states, num_triplets, index)
             soc_vec = _soc_matrix(atoms, num_states, num_triplets, index, key="REF_soc_vec", depth=3)
+            if "REF_tdm_t" in atoms.info:
+                found = np.asarray(atoms.info["REF_tdm_t"], float).reshape(-1)
+                required = num_triplets * num_triplets * 3
+                if found.size < required:
+                    raise ValueError(
+                        f"configuration {index} has {found.size} triplet-dipole values, "
+                        f"fewer than the {required} requested"
+                    )
+                tdm_t = found[:required].reshape(num_triplets, num_triplets, 3)
 
         configuration = data.Configuration(
             atomic_numbers=atoms.numbers,
@@ -151,12 +163,14 @@ def read_tdm_data(
             graph.energy_t = torch.tensor(energy_t, dtype=dtype).reshape(1, -1)
             graph.soc = torch.tensor(soc, dtype=dtype).reshape(1, num_states + 1, num_triplets)
             graph.soc_vec = torch.tensor(soc_vec, dtype=dtype).reshape(1, num_states + 1, num_triplets, 3)
+            graph.tdm_t = torch.tensor(tdm_t, dtype=dtype).reshape(1, num_triplets, num_triplets, 3)
             graph.osce_t = torch.tensor(osce_t, dtype=dtype).reshape(1, -1)
             graph.d_t = torch.tensor(d_t, dtype=dtype).reshape(1, -1)
         graphs.append(graph)
         for key, value in (
             ("energy_ex", energy), ("tdm", dipole), ("osce", strength),
-            ("energy_t", energy_t), ("soc", soc), ("soc_vec", soc_vec), ("osce_t", osce_t),
+            ("energy_t", energy_t), ("soc", soc), ("soc_vec", soc_vec),
+            ("tdm_t", tdm_t), ("osce_t", osce_t),
             ("d_s", d_s), ("d_t", d_t), ("gp", gp),
         ):
             collected[key].append(value)
@@ -164,7 +178,7 @@ def read_tdm_data(
         key: torch.tensor(np.asarray(value), dtype=dtype) for key, value in collected.items()
     }
     if num_triplets <= 0:
-        for key in ("energy_t", "soc", "soc_vec", "osce_t", "d_t"):
+        for key in ("energy_t", "soc", "soc_vec", "tdm_t", "osce_t", "d_t"):
             targets.pop(key)
     return graphs, targets, atoms_list
 
@@ -183,6 +197,7 @@ def batch_targets(batch) -> Dict[str, torch.Tensor]:
         targets["energy_t"] = batch.energy_t.view(num_graphs, num_triplets)
         targets["soc"] = batch.soc.view(num_graphs, -1, num_triplets)
         targets["soc_vec"] = batch.soc_vec.view(num_graphs, -1, num_triplets, 3)
+        targets["tdm_t"] = batch.tdm_t.view(num_graphs, num_triplets, num_triplets, 3)
         targets["osce_t"] = batch.osce_t.view(num_graphs, num_triplets)
         targets["d_t"] = batch.d_t.view(num_graphs, num_triplets)
     return targets
