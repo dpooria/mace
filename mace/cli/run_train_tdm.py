@@ -9,7 +9,9 @@ oscillator strengths) and, with ``--num-triplets N``, triplet excitation
 energies and the spin-orbit coupling magnitudes |<S_m|H_SO|T_k>| for
 m = 0..num_states, k = 1..N.  Labels a database does not have are NaN in the
 extxyz file and drop out of the loss, so the same command serves every
-ensemble.
+ensemble.  With ``--phosphorescence --phosphorescence-mode derived`` it also
+predicts the symmetric triplet-dipole matrix and evaluates the coherent
+two-term SOC-mixed T_i -> S0 oscillator strength.
 """
 
 import os
@@ -28,6 +30,7 @@ import numpy as np
 import torch
 
 from mace.modules.transition_dipole import (
+    PHOSPHORESCENCE_MODES,
     SOC_MODES,
     TransitionDipoleLoss,
     TransitionDipoleMACE,
@@ -50,8 +53,8 @@ from mace.transition_dipole_data import (
     save_json,
 )
 
-CHECKPOINT_VERSION = 2
-PREDICTION_KEYS = ("energy_ex", "tdm", "energy_t", "soc", "soc_vectors", "osce_t",
+CHECKPOINT_VERSION = 3
+PREDICTION_KEYS = ("energy_ex", "tdm", "energy_t", "soc", "soc_vectors", "tdm_t", "osce_t",
                    "susceptibility_s", "susceptibility_t", "ground_polarization")
 TARGET_OF = {"soc_vectors": "soc_vec", "susceptibility_s": "d_s", "susceptibility_t": "d_t",
              "ground_polarization": "gp"}
@@ -144,6 +147,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--phosphorescence-weight", type=float, default=1.0)
     parser.add_argument(
+        "--phosphorescence-mode",
+        choices=PHOSPHORESCENCE_MODES,
+        default="derived",
+        help="derived: calculate strengths from coherent SOC, singlet dipoles, and "
+        "the predicted triplet-dipole matrix; direct: legacy independent log-MLP",
+    )
+    parser.add_argument(
+        "--phosphorescence-linewidth",
+        type=float,
+        default=0.05,
+        help="physical linewidth Gamma in eV used in 1/(Delta+i Gamma) denominators",
+    )
+    parser.add_argument(
+        "--triplet-dipole-weight",
+        type=float,
+        default=1.0,
+        help="joint-gauge loss weight for REF_tdm_t",
+    )
+    parser.add_argument(
         "--calibrate",
         choices=["none", "mean"],
         default="mean",
@@ -163,7 +185,7 @@ def parse_args() -> argparse.Namespace:
         help="read the dipole straight off the vector head instead of "
         "factorising it into an invariant magnitude and a unit direction",
     )
-    parser.add_argument("--fine-tune", choices=["head", "last", "full"], default="head")
+    parser.add_argument("--fine-tune", choices=["head", "last", "full"], default="last")
     parser.add_argument(
         "--fine-tune-layers",
         type=int,
@@ -184,6 +206,13 @@ def parse_args() -> argparse.Namespace:
         "--cache-device",
         default=None,
         help="where the cached backbone features live (default: --device)",
+    )
+    parser.add_argument(
+        "--selection-objective",
+        choices=["total", "main"],
+        default="total",
+        help="validation objective used by the scheduler, early stopping, and best "
+        "checkpoint; total includes osce_t, d_s, d_t, and gp",
     )
     return parser.parse_args()
 
@@ -228,6 +257,11 @@ def evaluate_cached(model, loader, loss_fn, device):
     return total / count, main / count
 
 
+def selection_loss(valid_total: float, valid_main: float, objective: str) -> float:
+    """One explicit objective for scheduling, early stopping, and selection."""
+    return valid_total if objective == "total" else valid_main
+
+
 @torch.no_grad()
 def predict(model, loader, device):
     model.eval()
@@ -263,11 +297,15 @@ def model_options(args) -> dict:
         "soc_mode": args.soc_mode,
         "solvation": args.solvation,
         "phosphorescence": args.phosphorescence,
+        "phosphorescence_mode": args.phosphorescence_mode,
+        "phosphorescence_linewidth": args.phosphorescence_linewidth,
     }
 
 
 def main() -> None:
     args = parse_args()
+    if args.phosphorescence and args.phosphorescence_mode == "derived" and args.soc_mode != "diabatic":
+        raise ValueError("--phosphorescence-mode derived requires --soc-mode diabatic")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
     random.seed(args.seed)
@@ -315,6 +353,11 @@ def main() -> None:
         triplet_energy_weight=args.triplet_energy_weight,
         soc_weight=args.soc_weight,
         soc_vector_weight=args.soc_vector_weight if args.soc_mode == "diabatic" else 0.0,
+        triplet_dipole_weight=(
+            args.triplet_dipole_weight
+            if args.phosphorescence and args.phosphorescence_mode == "derived"
+            else 0.0
+        ),
         phosphorescence_weight=args.phosphorescence_weight if args.phosphorescence else 0.0,
         solvation_weight=args.solvation_weight if args.solvation else 0.0,
     ).to(args.device)
@@ -375,21 +418,22 @@ def main() -> None:
             total += loss.item() * size
             count += size
         valid_loss, valid_main = evaluate_cached(model, head_valid, loss_fn, args.device)
-        # the schedule and the selection see the main objective only, so the
-        # auxiliary branch cannot change how the main head is trained
-        scheduler.step(valid_main)
+        selected = selection_loss(valid_loss, valid_main, args.selection_objective)
+        scheduler.step(selected)
         record = {
             "stage": "head",
             "epoch": epoch,
             "train_loss": total / count,
             "valid_loss": valid_loss,
             "valid_main_loss": valid_main,
+            "selection_loss": selected,
+            "selection_objective": args.selection_objective,
         }
         history.append(record)
         if epoch == 1 or epoch % 25 == 0:
             print(json.dumps(record), flush=True)
-        if valid_main < best_loss:
-            best_loss, stale = valid_main, 0
+        if selected < best_loss:
+            best_loss, stale = selected, 0
             best_state = copy.deepcopy(model.state_dict())
         else:
             stale += 1
@@ -413,6 +457,9 @@ def main() -> None:
             ],
             weight_decay=args.weight_decay,
         )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, factor=0.5, patience=25, min_lr=1.0e-6
+        )
         shuffled = make_loader(train_graphs, args.batch_size, True)
         stale = 0
         for epoch in range(1, args.epochs + 1):
@@ -429,17 +476,21 @@ def main() -> None:
                 total += loss.item() * size
                 count += size
             valid_loss, valid_main = evaluate_graphs(model, valid_loader, loss_fn, args.device)
+            selected = selection_loss(valid_loss, valid_main, args.selection_objective)
+            scheduler.step(selected)
             record = {
                 "stage": args.fine_tune,
                 "epoch": epoch,
                 "train_loss": total / count,
                 "valid_loss": valid_loss,
                 "valid_main_loss": valid_main,
+                "selection_loss": selected,
+                "selection_objective": args.selection_objective,
             }
             history.append(record)
             print(json.dumps(record), flush=True)
-            if valid_main < best_loss:
-                best_loss, stale = valid_main, 0
+            if selected < best_loss:
+                best_loss, stale = selected, 0
                 best_state = copy.deepcopy(model.state_dict())
             else:
                 stale += 1

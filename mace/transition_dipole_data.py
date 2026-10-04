@@ -9,6 +9,7 @@ Per configuration the extxyz ``atoms.info`` may carry
     REF_soc         |<S_m|H_SO|T_k>|, eV, flattened (n_S + 1, n_T)  optional
     REF_soc_shape   the two dimensions of REF_soc                    with REF_soc
     REF_soc_vec     the couplings as Cartesian axial vectors, (n_S + 1, n_T, 3)  optional
+    REF_tdm_t       <T_i|mu|T_j>, a.u., flattened (n_T, n_T, 3)        optional
     REF_osce_t      T_k -> S0 strengths, (n_T,)                      optional
     REF_d_s, REF_d_t, REF_gp   PCM susceptibilities and ground-state polarization, eV, optional
 
@@ -74,6 +75,36 @@ def _soc_matrix(
     return block
 
 
+def _triplet_dipole_matrix(atoms: Atoms, num_triplets: int, index: int) -> np.ndarray:
+    """Read a full or upper-triangular symmetric <T_i|mu|T_j> tensor."""
+    block = np.full((num_triplets, num_triplets, 3), np.nan)
+    if "REF_tdm_t" not in atoms.info or num_triplets <= 0:
+        return block
+    vectors = np.asarray(atoms.info["REF_tdm_t"], float).reshape(-1, 3)
+    full = num_triplets * num_triplets
+    triangular = num_triplets * (num_triplets + 1) // 2
+    if len(vectors) == full:
+        matrix = vectors.reshape(num_triplets, num_triplets, 3)
+        # Average the Hermitian partners while preserving one-sided NaNs.
+        transpose = matrix.transpose(1, 0, 2)
+        both = np.isfinite(matrix) & np.isfinite(transpose)
+        block = np.where(
+            both,
+            0.5 * (matrix + transpose),
+            np.where(np.isfinite(matrix), matrix, transpose),
+        )
+    elif len(vectors) == triangular:
+        rows, cols = np.triu_indices(num_triplets)
+        block[rows, cols] = vectors
+        block[cols, rows] = vectors
+    else:
+        raise ValueError(
+            f"configuration {index} has {len(vectors)} REF_tdm_t vectors; "
+            f"expected {full} (full matrix) or {triangular} (upper triangle)"
+        )
+    return block
+
+
 def read_tdm_data(
     path: str,
     backbone: torch.nn.Module,
@@ -87,7 +118,7 @@ def read_tdm_data(
     graphs: List[data.AtomicData] = []
     collected: Dict[str, list] = {
         key: [] for key in
-        ("energy_ex", "tdm", "osce", "energy_t", "soc", "soc_vec", "osce_t", "d_s", "d_t", "gp")
+        ("energy_ex", "tdm", "osce", "energy_t", "soc", "soc_vec", "tdm_t", "osce_t", "d_s", "d_t", "gp")
     }
     for index, atoms in enumerate(atoms_list):
         if require_targets:
@@ -118,6 +149,7 @@ def read_tdm_data(
         osce_t = np.full(max(num_triplets, 0), np.nan)
         soc = np.full((num_states + 1, max(num_triplets, 0)), np.nan)
         soc_vec = np.full((num_states + 1, max(num_triplets, 0), 3), np.nan)
+        tdm_t = np.full((max(num_triplets, 0), max(num_triplets, 0), 3), np.nan)
         d_s = _optional(atoms, "REF_d_s", num_states)
         d_t = _optional(atoms, "REF_d_t", max(num_triplets, 0))
         gp = float(np.asarray(atoms.info.get("REF_gp", np.nan), float).reshape(-1)[0])
@@ -130,6 +162,7 @@ def read_tdm_data(
             osce_t = _optional(atoms, "REF_osce_t", num_triplets)
             soc = _soc_matrix(atoms, num_states, num_triplets, index)
             soc_vec = _soc_matrix(atoms, num_states, num_triplets, index, key="REF_soc_vec", depth=3)
+            tdm_t = _triplet_dipole_matrix(atoms, num_triplets, index)
 
         configuration = data.Configuration(
             atomic_numbers=atoms.numbers,
@@ -151,12 +184,13 @@ def read_tdm_data(
             graph.energy_t = torch.tensor(energy_t, dtype=dtype).reshape(1, -1)
             graph.soc = torch.tensor(soc, dtype=dtype).reshape(1, num_states + 1, num_triplets)
             graph.soc_vec = torch.tensor(soc_vec, dtype=dtype).reshape(1, num_states + 1, num_triplets, 3)
+            graph.tdm_t = torch.tensor(tdm_t, dtype=dtype).reshape(1, num_triplets, num_triplets, 3)
             graph.osce_t = torch.tensor(osce_t, dtype=dtype).reshape(1, -1)
             graph.d_t = torch.tensor(d_t, dtype=dtype).reshape(1, -1)
         graphs.append(graph)
         for key, value in (
             ("energy_ex", energy), ("tdm", dipole), ("osce", strength),
-            ("energy_t", energy_t), ("soc", soc), ("soc_vec", soc_vec), ("osce_t", osce_t),
+            ("energy_t", energy_t), ("soc", soc), ("soc_vec", soc_vec), ("tdm_t", tdm_t), ("osce_t", osce_t),
             ("d_s", d_s), ("d_t", d_t), ("gp", gp),
         ):
             collected[key].append(value)
@@ -164,7 +198,7 @@ def read_tdm_data(
         key: torch.tensor(np.asarray(value), dtype=dtype) for key, value in collected.items()
     }
     if num_triplets <= 0:
-        for key in ("energy_t", "soc", "soc_vec", "osce_t", "d_t"):
+        for key in ("energy_t", "soc", "soc_vec", "tdm_t", "osce_t", "d_t"):
             targets.pop(key)
     return graphs, targets, atoms_list
 
@@ -183,6 +217,7 @@ def batch_targets(batch) -> Dict[str, torch.Tensor]:
         targets["energy_t"] = batch.energy_t.view(num_graphs, num_triplets)
         targets["soc"] = batch.soc.view(num_graphs, -1, num_triplets)
         targets["soc_vec"] = batch.soc_vec.view(num_graphs, -1, num_triplets, 3)
+        targets["tdm_t"] = batch.tdm_t.view(num_graphs, num_triplets, num_triplets, 3)
         targets["osce_t"] = batch.osce_t.view(num_graphs, num_triplets)
         targets["d_t"] = batch.d_t.view(num_graphs, num_triplets)
     return targets
@@ -327,6 +362,22 @@ def regression_report(
     norms = np.sqrt(np.clip(target_square * prediction_square, 1.0e-24, None))
     report["tdm_square"] = _column_metrics(target_square, prediction_square)
     report["tdm_abs_cosine"] = {"mean": np.nanmean(overlap / norms, axis=0).tolist()}
+    if "tdm_t" in target and "tdm_t" in prediction and np.isfinite(target["tdm_t"]).any():
+        ref_square = (target["tdm_t"] ** 2).sum(axis=-1).reshape(len(target["tdm_t"]), -1)
+        pred_square = (prediction["tdm_t"] ** 2).sum(axis=-1).reshape(len(prediction["tdm_t"]), -1)
+        report["tdm_t_square"] = _column_metrics(ref_square, pred_square)
+        report["tdm_t_symmetry_max"] = {
+            "value": [
+                float(
+                    np.nanmax(
+                        np.abs(
+                            prediction["tdm_t"]
+                            - prediction["tdm_t"].transpose(0, 2, 1, 3)
+                        )
+                    )
+                )
+            ]
+        }
 
     if "osce" in target and "osce" in prediction:
         total_target = target["osce"].sum(axis=1)

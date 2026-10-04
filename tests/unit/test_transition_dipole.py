@@ -409,6 +409,13 @@ def _aux_targets(num_configs: int = 6, seed: int = 11):
     targets = _labelled_targets(num_configs, seed)
     generator = torch.Generator().manual_seed(seed + 1)
     targets["soc_vec"] = 1.0e-4 * torch.randn(num_configs, NUM_STATES + 1, NUM_TRIPLETS, 3, generator=generator, dtype=torch.float64)
+    triplet_dipoles = torch.randn(
+        num_configs, NUM_TRIPLETS, NUM_TRIPLETS, 3,
+        generator=generator, dtype=torch.float64,
+    )
+    targets["tdm_t"] = 0.5 * (
+        triplet_dipoles + triplet_dipoles.transpose(1, 2)
+    )
     targets["osce_t"] = 1.0e-8 * torch.exp(torch.randn(num_configs, NUM_TRIPLETS, generator=generator, dtype=torch.float64))
     targets["d_s"] = 0.05 + 0.01 * torch.randn(num_configs, NUM_STATES, generator=generator, dtype=torch.float64)
     targets["d_t"] = 0.01 + 0.003 * torch.randn(num_configs, NUM_TRIPLETS, generator=generator, dtype=torch.float64)
@@ -471,7 +478,7 @@ def test_auxiliary_losses_do_not_reach_the_main_parameters(aux_model, backbone):
     aux_model.zero_grad(set_to_none=True)
 
 
-def test_soc_vector_loss_is_phase_free_and_zero_at_target(aux_model, backbone):
+def test_soc_vector_loss_uses_a_shared_state_gauge(aux_model, backbone):
     from mace.modules.transition_dipole import TransitionDipoleLoss, target_statistics
 
     targets = _aux_targets()
@@ -482,10 +489,14 @@ def test_soc_vector_loss_is_phase_free_and_zero_at_target(aux_model, backbone):
     output = run(aux_model, backbone, [make_atoms(3)])
     target = {key: value[:1] for key, value in targets.items()}
     target["soc_vec"] = output["soc_vectors"].clone()
+    target["tdm"] = output["tdm"].clone()
     assert float(loss_fn(output, target)) < 1e-18
-    target["soc_vec"][:, 1:] *= -1.0  # arbitrary sign per pair
+    # A singlet-state sign changes its transition dipole and its whole SOC row.
+    target["tdm"][:, 0] *= -1.0
+    target["soc_vec"][:, 1] *= -1.0
     assert float(loss_fn(output, target)) < 1e-18
-    target["soc_vec"][:, 1, 0] *= 2.0
+    # An isolated pair sign is not a legal electronic-state gauge.
+    target["soc_vec"][:, 1, 0] *= -1.0
     assert float(loss_fn(output, target)) > 0.0
 
 
@@ -536,3 +547,101 @@ def test_susceptibilities_are_never_negative(aux_model, backbone):
         with torch.no_grad():
             for p, value in zip(params, saved):
                 p.copy_(value)
+
+
+@pytest.fixture(scope="module")
+def derived_phosphorescence_model(backbone):
+    torch.manual_seed(13)
+    built = TransitionDipoleMACE(
+        backbone=backbone,
+        num_states=NUM_STATES,
+        num_triplets=NUM_TRIPLETS,
+        phosphorescence=True,
+        phosphorescence_mode="derived",
+        soc_mode="diabatic",
+        phosphorescence_linewidth=0.05,
+    ).double()
+    built.set_target_statistics(_aux_targets())
+    with torch.no_grad():
+        built.head.soc.weights.weight.normal_(std=0.5)
+        built.head.triplet_dipole.weights.weight.normal_(std=0.5)
+    built.eval()
+    return built
+
+
+def test_derived_phosphorescence_outputs_are_complete_and_invariant(
+    derived_phosphorescence_model, backbone
+):
+    atoms = make_atoms(14)
+    rotated = atoms.copy()
+    rotation = Rotation.random(random_state=14).as_matrix()
+    rotated.positions = atoms.positions @ rotation.T
+    reference = run(derived_phosphorescence_model, backbone, [atoms])
+    turned = run(derived_phosphorescence_model, backbone, [rotated])
+    assert reference["tdm_t"].shape == (1, NUM_TRIPLETS, NUM_TRIPLETS, 3)
+    assert reference["phosphorescence_tdm"].shape == (
+        1, NUM_TRIPLETS, 3, 3, 2
+    )
+    assert torch.allclose(
+        reference["tdm_t"], reference["tdm_t"].transpose(1, 2), atol=1.0e-10
+    )
+    assert bool((reference["osce_t"] >= 0).all())
+    assert torch.allclose(reference["osce_t"], turned["osce_t"], atol=1.0e-8)
+    assert np.allclose(
+        turned["tdm_t"].numpy(), reference["tdm_t"].numpy() @ rotation.T, atol=1.0e-8
+    )
+
+
+def test_phosphorescence_linewidth_regularises_resonance():
+    from mace.modules.transition_dipole import phosphorescence_properties
+
+    soc = torch.ones(1, 2, 1, 3, dtype=torch.float64) * 1.0e-4
+    singlet_dipole = torch.ones(1, 1, 3, dtype=torch.float64)
+    triplet_dipole = torch.ones(1, 1, 1, 3, dtype=torch.float64)
+    energy = torch.tensor([[3.0]], dtype=torch.float64)
+    effective, strength = phosphorescence_properties(
+        soc, singlet_dipole, triplet_dipole, energy, energy, 0.05
+    )
+    assert torch.isfinite(effective).all()
+    assert torch.isfinite(strength).all()
+    assert bool((strength >= 0).all())
+
+
+def test_joint_gauge_loss_preserves_coherent_matrix_elements(
+    derived_phosphorescence_model, backbone
+):
+    from mace.modules.transition_dipole import TransitionDipoleLoss, target_statistics
+
+    output = run(derived_phosphorescence_model, backbone, [make_atoms(15)])
+    target = {
+        "energy_ex": output["energy_ex"].clone(),
+        "tdm": output["tdm"].clone(),
+        "osce": oscillator_strength(output["tdm"], output["energy_ex"]),
+        "energy_t": output["energy_t"].clone(),
+        "soc": output["soc"].clone(),
+        "soc_vec": output["soc_vectors"].clone(),
+        "tdm_t": output["tdm_t"].clone(),
+        "osce_t": output["osce_t"].clone(),
+    }
+    singlet_sign = torch.tensor([[-1.0] * NUM_STATES], dtype=torch.float64)
+    triplet_sign = torch.tensor([[-1.0, 1.0]], dtype=torch.float64)
+    target["tdm"] *= singlet_sign.unsqueeze(-1)
+    rows = torch.cat((torch.ones(1, 1, dtype=torch.float64), singlet_sign), dim=1)
+    target["soc_vec"] *= (
+        rows.unsqueeze(-1) * triplet_sign.unsqueeze(1)
+    ).unsqueeze(-1)
+    target["tdm_t"] *= (
+        triplet_sign.unsqueeze(-1) * triplet_sign.unsqueeze(-2)
+    ).unsqueeze(-1)
+    loss_fn = TransitionDipoleLoss(
+        target_statistics(target),
+        tensor_weight=0.0,
+        energy_weight=0.0,
+        strength_weight=0.0,
+        triplet_energy_weight=0.0,
+        soc_weight=0.0,
+        soc_vector_weight=1.0,
+        triplet_dipole_weight=1.0,
+        phosphorescence_weight=0.0,
+    )
+    assert float(loss_fn(output, target)) < 1.0e-18

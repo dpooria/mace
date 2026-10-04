@@ -8,6 +8,8 @@ One head predicts, for any molecule,
     triplets  T_1..T_nT   excitation energies
     couplings             spin-orbit coupling magnitudes |<S_m|H_SO|T_k>|,
                           m = 0..nS, k = 1..nT (sublevel root-sum-square)
+    phosphorescence       symmetric <T_i|mu|T_j> vectors and the coherent
+                          two-term SOC-mixed T_i -> S0 oscillator strengths
 
 Predicting ``mu`` rather than ``f`` is worth doing for three reasons: ``mu``
 is a vector, so the equivariant part of the backbone can be used instead of
@@ -61,6 +63,7 @@ HARTREE_PER_EV = 1.0 / 27.211386245988
 UNIT_MAGNITUDE = 0.5413  # softplus(0.5413) = 1: magnitudes start at the reference
 LOG_FLOOR = 1.0e-12
 SOC_MODES = ("none", "direct", "diabatic")
+PHOSPHORESCENCE_MODES = ("direct", "derived")
 
 
 # --------------------------------------------------------------------- eigh
@@ -124,6 +127,15 @@ def _symmetric(entries: torch.Tensor, size: int) -> torch.Tensor:
     matrix[..., rows, cols] = entries
     matrix = matrix + matrix.transpose(-1, -2)
     return matrix - 0.5 * torch.diag_embed(torch.diagonal(matrix, dim1=-2, dim2=-1))
+
+
+def _symmetric_vectors(entries: torch.Tensor, size: int) -> torch.Tensor:
+    """Unique upper-triangle vectors -> a symmetric state x state vector tensor."""
+    rows, cols = torch.triu_indices(size, size, device=entries.device)
+    matrix = entries.new_zeros(*entries.shape[:-2], size, size, entries.shape[-1])
+    matrix[..., rows, cols, :] = entries
+    matrix[..., cols, rows, :] = entries
+    return matrix
 
 
 def _mlp(sizes: List[int], dropout: float = 0.0) -> torch.nn.Sequential:
@@ -374,6 +386,9 @@ class TransitionDipoleHead(torch.nn.Module):
         mixing_t       (G, nT, nT)    H_T
         soc            (G, nS+1, nT)  |<S_m|H_SO|T_k>|, m = 0..nS, eV
         soc_vectors    (G, nS+1, nT, 3)  adiabatic axial vectors (diabatic mode)
+        tdm_t          (G, nT, nT, 3)     adiabatic <T_i|mu|T_j>
+        phosphorescence_tdm (G, nT, 3, 3, 2) effective (m, alpha, real/imag) dipoles
+        osce_t         (G, nT)            derived triplet oscillator strengths
     """
 
     def __init__(
@@ -392,10 +407,18 @@ class TransitionDipoleHead(torch.nn.Module):
         soc_mode: str = "diabatic",
         solvation: bool = False,
         phosphorescence: bool = False,
+        phosphorescence_mode: str = "direct",
+        phosphorescence_linewidth: float = 0.05,
     ):
         super().__init__()
         if soc_mode not in SOC_MODES:
             raise ValueError(f"soc_mode must be one of {SOC_MODES}")
+        if phosphorescence_mode not in PHOSPHORESCENCE_MODES:
+            raise ValueError(
+                f"phosphorescence_mode must be one of {PHOSPHORESCENCE_MODES}"
+            )
+        if phosphorescence_linewidth <= 0.0:
+            raise ValueError("phosphorescence_linewidth must be positive")
         if num_states < 1:
             raise ValueError("at least one singlet state is needed")
         self.num_states = num_states
@@ -404,6 +427,8 @@ class TransitionDipoleHead(torch.nn.Module):
         self.factorised = factorised
         self.soc_mode = soc_mode if num_triplets > 0 else "none"
         self.eigh_eps = eigh_eps
+        self.phosphorescence_mode = phosphorescence_mode
+        self.phosphorescence_linewidth = phosphorescence_linewidth
 
         self.atom_mlp = _mlp([scalar_dim, hidden_dim, hidden_dim], dropout)
         self.register_buffer("feature_mean", torch.zeros(scalar_dim))
@@ -439,7 +464,25 @@ class TransitionDipoleHead(torch.nn.Module):
         # depend on: the main outputs are identical with or without it.
         self.solvation = solvation
         self.phosphorescence = phosphorescence and num_triplets > 0
-        if self.solvation or self.phosphorescence:
+        if self.phosphorescence and self.phosphorescence_mode == "derived":
+            if self.soc_mode != "diabatic":
+                raise ValueError(
+                    "derived phosphorescence requires soc_mode='diabatic' so coherent "
+                    "SOC amplitudes are available"
+                )
+            triplet_pairs = num_triplets * (num_triplets + 1) // 2
+            self.triplet_dipole = VectorReadout(
+                hidden_dim,
+                vector_dim,
+                triplet_pairs,
+                "polar",
+                dropout,
+                "linear",
+                factorised,
+            )
+        if self.solvation or (
+            self.phosphorescence and self.phosphorescence_mode == "direct"
+        ):
             self.aux_mlp = _mlp([scalar_dim, hidden_dim, hidden_dim], dropout)
         if self.solvation:
             # PCM susceptibilities are solvent stabilisations and never negative
@@ -459,7 +502,7 @@ class TransitionDipoleHead(torch.nn.Module):
             _small_output(self.gp_mlp)
             self.register_buffer("gp_mean", torch.zeros(()))
             self.register_buffer("gp_scale", torch.ones(()))
-        if self.phosphorescence:
+        if self.phosphorescence and self.phosphorescence_mode == "direct":
             self.osce_t_mlp = _mlp([2 * hidden_dim, hidden_dim, num_triplets], dropout)
             self.register_buffer("osce_t_log_reference", torch.zeros(num_triplets))
             self.register_buffer("osce_t_log_scale", torch.ones(num_triplets))
@@ -497,7 +540,11 @@ class TransitionDipoleHead(torch.nn.Module):
 
         if self.soc_mode != "none" and "soc" in target:
             self.soc_calibration.copy_(factor(prediction["soc"], target["soc"]))
-        if self.phosphorescence and "osce_t" in target:
+        if (
+            self.phosphorescence
+            and self.phosphorescence_mode == "direct"
+            and "osce_t" in target
+        ):
             self.osce_t_calibration.copy_(factor(prediction["osce_t"], target["osce_t"]))
 
     def set_target_statistics(self, targets: Dict[str, torch.Tensor]) -> None:
@@ -510,7 +557,11 @@ class TransitionDipoleHead(torch.nn.Module):
                 self.d_t_scale.copy_(_fill(nanstd(targets["d_t"]), 1.0).clamp_min(1.0e-6))
             self.gp_mean.copy_(_fill(nanmean(targets["gp"]), 0.0))
             self.gp_scale.copy_(_fill(nanstd(targets["gp"]), 1.0).clamp_min(1.0e-6))
-        if self.phosphorescence and "osce_t" in targets:
+        if (
+            self.phosphorescence
+            and self.phosphorescence_mode == "direct"
+            and "osce_t" in targets
+        ):
             mean, std = self._log_statistics(targets["osce_t"])
             self.osce_t_log_reference.copy_(mean)
             self.osce_t_log_scale.copy_(std)
@@ -519,6 +570,19 @@ class TransitionDipoleHead(torch.nn.Module):
         self.dipole.set_reference(torch.sqrt(nanmean(dipole.square().sum(-1))))
         if self.num_triplets > 0 and "energy_t" in targets:
             self.triplet.set_statistics(targets["energy_t"])
+        if (
+            self.phosphorescence
+            and self.phosphorescence_mode == "derived"
+            and "tdm_t" in targets
+        ):
+            triplet_dipole = targets["tdm_t"]
+            rows, cols = torch.triu_indices(
+                self.num_triplets, self.num_triplets, device=triplet_dipole.device
+            )
+            rms = torch.sqrt(
+                nanmean(triplet_dipole[:, rows, cols].square().sum(-1))
+            )
+            self.triplet_dipole.set_reference(rms)
         if self.soc_mode != "none" and "soc" in targets:
             soc = targets["soc"].reshape(targets["soc"].shape[0], -1)
             if self.soc_mode == "diabatic":
@@ -561,9 +625,23 @@ class TransitionDipoleHead(torch.nn.Module):
         if self.num_triplets > 0:
             energies_t, rotation_t, mixing_t = self.triplet(pooled)
             output.update({"energy_t": energies_t, "rotation_t": rotation_t, "mixing_t": mixing_t})
-        output.update(self._auxiliary(scalars, batch, num_graphs, rotation, rotation_t))
         if self.num_triplets == 0:
+            output.update(self._auxiliary(scalars, batch, num_graphs, rotation, rotation_t))
             return output
+
+        if self.phosphorescence and self.phosphorescence_mode == "derived":
+            unique_triplet_dipoles = self.triplet_dipole(*args)
+            diabatic_triplet_dipoles = _symmetric_vectors(
+                unique_triplet_dipoles, self.num_triplets
+            )
+            adiabatic_triplet_dipoles = torch.einsum(
+                "gki,gkla,glj->gija",
+                rotation_t,
+                diabatic_triplet_dipoles,
+                rotation_t,
+            )
+            output["tdm_t_diabatic"] = diabatic_triplet_dipoles
+            output["tdm_t"] = adiabatic_triplet_dipoles
 
         rows, cols = self.num_states + 1, self.num_triplets
         if self.soc_mode == "diabatic":
@@ -581,11 +659,26 @@ class TransitionDipoleHead(torch.nn.Module):
         elif self.soc_mode == "direct":
             logged = self.soc_log_reference + self.soc_log_scale * self.soc(pooled)
             output["soc"] = torch.exp(logged).view(num_graphs, rows, cols) * self.soc_calibration
+        output.update(self._auxiliary(scalars, batch, num_graphs, rotation, rotation_t))
+        if self.phosphorescence and self.phosphorescence_mode == "derived":
+            effective, strength = phosphorescence_properties(
+                output["soc_vectors"],
+                output["tdm"],
+                output["tdm_t"],
+                output["energy_ex"],
+                output["energy_t"],
+                self.phosphorescence_linewidth,
+            )
+            output["phosphorescence_tdm"] = effective
+            output["osce_t"] = strength
         return output
 
     def _auxiliary(self, scalars, batch, num_graphs, rotation, rotation_t) -> Dict[str, torch.Tensor]:
         """Solvation and phosphorescence outputs from the detached auxiliary branch."""
-        if not (self.solvation or self.phosphorescence):
+        if not (
+            self.solvation
+            or (self.phosphorescence and self.phosphorescence_mode == "direct")
+        ):
             return {}
         hidden = self.aux_mlp((scalars - self.feature_mean) / self.feature_std)
         mean = scatter_mean(hidden, batch, dim=0, dim_size=num_graphs)
@@ -610,7 +703,7 @@ class TransitionDipoleHead(torch.nn.Module):
             if self.num_triplets > 0:
                 out["susceptibility_t"] = rotated(self.d_t_mlp, self.num_triplets, self.d_t_mean, self.d_t_scale, rotation_t)
             out["ground_polarization"] = self.gp_mlp(pooled).squeeze(-1) * self.gp_scale + self.gp_mean
-        if self.phosphorescence:
+        if self.phosphorescence and self.phosphorescence_mode == "direct":
             logged = self.osce_t_log_reference + self.osce_t_log_scale * self.osce_t_mlp(pooled)
             out["osce_t"] = torch.exp(logged) * self.osce_t_calibration
         return out
@@ -635,6 +728,8 @@ class TransitionDipoleMACE(torch.nn.Module):
         soc_mode: str = "diabatic",
         solvation: bool = False,
         phosphorescence: bool = False,
+        phosphorescence_mode: str = "direct",
+        phosphorescence_linewidth: float = 0.05,
     ):
         super().__init__()
         self.backbone = backbone
@@ -657,6 +752,8 @@ class TransitionDipoleMACE(torch.nn.Module):
             soc_mode=soc_mode,
             solvation=solvation,
             phosphorescence=phosphorescence,
+            phosphorescence_mode=phosphorescence_mode,
+            phosphorescence_linewidth=phosphorescence_linewidth,
         )
         if energy_reference is not None:
             self.head.singlet.energy_reference.copy_(energy_reference)
@@ -742,6 +839,60 @@ def oscillator_strength(
     return (2.0 / 3.0) * (energy_ex_ev * HARTREE_PER_EV) * dipole.square().sum(-1)
 
 
+def phosphorescence_properties(
+    soc_vectors: torch.Tensor,
+    singlet_dipoles: torch.Tensor,
+    triplet_dipoles: torch.Tensor,
+    singlet_energies_ev: torch.Tensor,
+    triplet_energies_ev: torch.Tensor,
+    linewidth_ev: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Two-term SOC-mixed T_i -> S0 dipoles and oscillator strengths.
+
+    ``soc_vectors`` carries the spin-sublevel index ``m`` in its final axis;
+    the final axis of each dipole carries the spatial component ``alpha``.
+    A finite linewidth evaluates ``1 / (Delta + i Gamma)`` without a hard
+    denominator clamp.  The returned effective dipole stores real and
+    imaginary parts in its final dimension: ``(G, nT, m, alpha, 2)``.
+    """
+    gamma = torch.as_tensor(
+        linewidth_ev, dtype=triplet_energies_ev.dtype, device=triplet_energies_ev.device
+    )
+
+    def inverse_parts(delta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        denominator = delta.square() + gamma.square()
+        return delta / denominator, -gamma / denominator
+
+    # Term 1: S0-T_J SOC times <T_J|mu|T_i> / (E_S0-E_TJ), with E_S0=0.
+    inverse_1 = inverse_parts(-triplet_energies_ev)
+    term_1_real = torch.einsum(
+        "gjm,gjia->gima", soc_vectors[:, 0] * inverse_1[0].unsqueeze(-1), triplet_dipoles
+    )
+    term_1_imag = torch.einsum(
+        "gjm,gjia->gima", soc_vectors[:, 0] * inverse_1[1].unsqueeze(-1), triplet_dipoles
+    )
+
+    # Term 2: S_n-T_i SOC times <S0|mu|S_n> / (E_Ti-E_Sn).
+    gaps = triplet_energies_ev.unsqueeze(1) - singlet_energies_ev.unsqueeze(2)
+    inverse_2 = inverse_parts(gaps)
+    term_2_real = torch.einsum(
+        "gnim,gna->gima", soc_vectors[:, 1:] * inverse_2[0].unsqueeze(-1), singlet_dipoles
+    )
+    term_2_imag = torch.einsum(
+        "gnim,gna->gima", soc_vectors[:, 1:] * inverse_2[1].unsqueeze(-1), singlet_dipoles
+    )
+
+    effective = torch.stack(
+        (term_1_real + term_2_real, term_1_imag + term_2_imag), dim=-1
+    )
+    strength = (
+        (2.0 / 3.0)
+        * (triplet_energies_ev * HARTREE_PER_EV)
+        * effective.square().sum(dim=(-1, -2, -3))
+    )
+    return effective, strength
+
+
 def masked_mean(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     """Mean over the entries whose label exists; zero when none does."""
     weight = valid.to(values.dtype)
@@ -771,6 +922,11 @@ def target_statistics(targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tenso
     if "soc_vec" in targets:
         rms = torch.sqrt(nanmean(targets["soc_vec"].square().sum(-1)))
         statistics["soc_vec_rms"] = _fill(rms, float(_fill(torch.nanmean(rms), 1.0)))
+    if "tdm_t" in targets:
+        rms = torch.sqrt(nanmean(targets["tdm_t"].square().sum(-1)))
+        statistics["tdm_t_rms"] = _fill(
+            rms, float(_fill(torch.nanmean(rms), 1.0))
+        )
     if "osce_t" in targets:
         statistics["osce_t_log_std"] = log_std(targets["osce_t"])
     for key in ("d_s", "d_t", "gp"):
@@ -802,6 +958,7 @@ class TransitionDipoleLoss(torch.nn.Module):
         triplet_energy_weight: float = 1.0,
         soc_weight: float = 1.0,
         soc_vector_weight: float = 0.0,
+        triplet_dipole_weight: float = 0.0,
         phosphorescence_weight: float = 0.0,
         solvation_weight: float = 0.0,
     ):
@@ -815,6 +972,7 @@ class TransitionDipoleLoss(torch.nn.Module):
             "soc_log_std", statistics.get("soc_log_std", torch.ones(1)).clamp_min(1.0e-3)
         )
         self.register_buffer("soc_vec_rms", statistics.get("soc_vec_rms", torch.ones(1)).clamp_min(LOG_FLOOR))
+        self.register_buffer("tdm_t_rms", statistics.get("tdm_t_rms", torch.ones(1)).clamp_min(LOG_FLOOR))
         self.register_buffer("osce_t_log_std", statistics.get("osce_t_log_std", torch.ones(1)).clamp_min(1.0e-3))
         for key in ("d_s", "d_t", "gp"):
             self.register_buffer(f"{key}_std", statistics.get(f"{key}_std", torch.ones(1)).clamp_min(1.0e-8))
@@ -826,16 +984,112 @@ class TransitionDipoleLoss(torch.nn.Module):
         self.triplet_energy_weight = triplet_energy_weight
         self.soc_weight = soc_weight
         self.soc_vector_weight = soc_vector_weight
+        self.triplet_dipole_weight = triplet_dipole_weight
         self.phosphorescence_weight = phosphorescence_weight
         self.solvation_weight = solvation_weight
+
+    def _joint_gauge_references(
+        self, prediction: Dict[str, torch.Tensor], target: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Choose one consistent singlet/triplet phase gauge per geometry.
+
+        Electronic-state signs act jointly on all matrix elements.  Matching
+        each vector independently destroys the interference used by the
+        two-term phosphorescence expression, so all 2^(nS+nT) sign choices are
+        scored together.  State counts are small (normally 3-5 singlets and
+        3 triplets), making exhaustive discrete alignment cheap and exact.
+        """
+        tdm_reference = target["tdm"]
+        soc_reference = target.get("soc_vec")
+        triplet_reference = target.get("tdm_t")
+        if "soc_vectors" not in prediction and "tdm_t" not in prediction:
+            return tdm_reference, soc_reference, triplet_reference
+
+        graphs, singlets = tdm_reference.shape[:2]
+        triplets = prediction["energy_t"].shape[1]
+        count = 1 << (singlets + triplets)
+        choices = torch.arange(count, device=tdm_reference.device)
+        bits = torch.arange(singlets + triplets, device=tdm_reference.device)
+        signs = 1.0 - 2.0 * ((choices[:, None] >> bits[None, :]) & 1).to(tdm_reference.dtype)
+        singlet_signs = signs[:, :singlets]
+        triplet_signs = signs[:, singlets:]
+
+        aligned_tdm = tdm_reference.clone()
+        aligned_soc = None if soc_reference is None else soc_reference.clone()
+        aligned_triplet = None if triplet_reference is None else triplet_reference.clone()
+        for graph in range(graphs):
+            score = tdm_reference.new_zeros(count)
+
+            valid = torch.isfinite(tdm_reference[graph]).all(-1)
+            transformed = tdm_reference[graph].unsqueeze(0) * singlet_signs.unsqueeze(-1)
+            error = (
+                prediction["tdm"][graph].detach().unsqueeze(0)
+                - torch.nan_to_num(transformed)
+            ) / self.dipole_std.view(1, -1, 1)
+            score = score + (
+                error.square().sum(-1) * valid.unsqueeze(0)
+            ).sum(-1) / valid.sum().clamp_min(1)
+
+            if soc_reference is not None and "soc_vectors" in prediction:
+                valid_soc = torch.isfinite(soc_reference[graph]).all(-1)
+                row_signs = torch.cat(
+                    (torch.ones(count, 1, device=signs.device, dtype=signs.dtype), singlet_signs),
+                    dim=1,
+                )
+                pair_signs = row_signs.unsqueeze(-1) * triplet_signs.unsqueeze(1)
+                transformed_soc = soc_reference[graph].unsqueeze(0) * pair_signs.unsqueeze(-1)
+                scale = self.soc_vec_rms.view(1, *soc_reference.shape[1:-1], 1)
+                error_soc = (
+                    prediction["soc_vectors"][graph].detach().unsqueeze(0)
+                    - torch.nan_to_num(transformed_soc)
+                ) / scale
+                score = score + (
+                    error_soc.square().sum(-1) * valid_soc.unsqueeze(0)
+                ).sum((-1, -2)) / valid_soc.sum().clamp_min(1)
+
+            if triplet_reference is not None and "tdm_t" in prediction:
+                valid_triplet = torch.isfinite(triplet_reference[graph]).all(-1)
+                pair_signs = triplet_signs.unsqueeze(-1) * triplet_signs.unsqueeze(-2)
+                transformed_triplet = (
+                    triplet_reference[graph].unsqueeze(0) * pair_signs.unsqueeze(-1)
+                )
+                scale = self.tdm_t_rms.view(1, *triplet_reference.shape[1:-1], 1)
+                error_triplet = (
+                    prediction["tdm_t"][graph].detach().unsqueeze(0)
+                    - torch.nan_to_num(transformed_triplet)
+                ) / scale
+                score = score + (
+                    error_triplet.square().sum(-1) * valid_triplet.unsqueeze(0)
+                ).sum((-1, -2)) / valid_triplet.sum().clamp_min(1)
+
+            best = score.argmin()
+            aligned_tdm[graph] = tdm_reference[graph] * singlet_signs[best].unsqueeze(-1)
+            if aligned_soc is not None:
+                row = torch.cat(
+                    (tdm_reference.new_ones(1), singlet_signs[best]), dim=0
+                )
+                aligned_soc[graph] = soc_reference[graph] * (
+                    row.unsqueeze(-1) * triplet_signs[best].unsqueeze(0)
+                ).unsqueeze(-1)
+            if aligned_triplet is not None:
+                aligned_triplet[graph] = triplet_reference[graph] * (
+                    triplet_signs[best].unsqueeze(-1)
+                    * triplet_signs[best].unsqueeze(-2)
+                ).unsqueeze(-1)
+        return aligned_tdm, aligned_soc, aligned_triplet
 
     def terms(
         self, prediction: Dict[str, torch.Tensor], target: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
         out: Dict[str, torch.Tensor] = {}
-        reference = target["tdm"]
+        reference, aligned_soc, aligned_triplet = self._joint_gauge_references(
+            prediction, target
+        )
         valid = torch.isfinite(reference).all(-1)
-        error = phase_matched_error(prediction["tdm"], torch.nan_to_num(reference))
+        if "soc_vectors" in prediction or "tdm_t" in prediction:
+            error = prediction["tdm"] - torch.nan_to_num(reference)
+        else:
+            error = phase_matched_error(prediction["tdm"], torch.nan_to_num(reference))
         out["dipole"] = masked_mean(
             (error / self.dipole_std.view(1, -1, 1)).square().mean(-1), valid
         )
@@ -878,13 +1132,20 @@ class TransitionDipoleLoss(torch.nn.Module):
             ) / self.soc_log_std.view(1, *reference.shape[1:])
             out["soc"] = masked_mean(error.square(), valid)
         if self.soc_vector_weight > 0.0 and "soc_vectors" in prediction and "soc_vec" in target:
-            # the coupling vector carries an arbitrary sign per pair: sign-matched
-            # quadratic error, scaled by the training RMS of the pair
-            reference = target["soc_vec"]
+            # Use the one shared electronic-state gauge selected jointly with
+            # singlet and triplet dipoles; pairwise sign matching would erase
+            # physically meaningful interference.
+            reference = aligned_soc
             valid = torch.isfinite(reference).all(-1)
-            error = phase_matched_error(prediction["soc_vectors"], torch.nan_to_num(reference))
+            error = prediction["soc_vectors"] - torch.nan_to_num(reference)
             scale = self.soc_vec_rms.view(1, *reference.shape[1:-1], 1)
             out["soc_vec"] = masked_mean((error / scale).square().mean(-1), valid)
+        if self.triplet_dipole_weight > 0.0 and "tdm_t" in prediction and "tdm_t" in target:
+            reference = aligned_triplet
+            valid = torch.isfinite(reference).all(-1)
+            error = prediction["tdm_t"] - torch.nan_to_num(reference)
+            scale = self.tdm_t_rms.view(1, *reference.shape[1:-1], 1)
+            out["tdm_t"] = masked_mean((error / scale).square().mean(-1), valid)
         if self.phosphorescence_weight > 0.0 and "osce_t" in prediction and "osce_t" in target:
             reference = target["osce_t"]
             valid = torch.isfinite(reference) & (reference > 0)
@@ -913,6 +1174,7 @@ class TransitionDipoleLoss(torch.nn.Module):
             "energy_t": self.triplet_energy_weight,
             "soc": self.soc_weight,
             "soc_vec": self.soc_vector_weight,
+            "tdm_t": self.triplet_dipole_weight,
             "osce_t": self.phosphorescence_weight,
             "d_s": self.solvation_weight,
             "d_t": self.solvation_weight,

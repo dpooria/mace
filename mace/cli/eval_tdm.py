@@ -102,7 +102,8 @@ def main() -> None:
         for batch in loader:
             batch = batch.to(args.device)
             prediction = model(batch.to_dict())
-            for key in ("tdm", "energy_ex", "energy_t", "soc", "soc_vectors", "osce_t",
+            for key in ("tdm", "energy_ex", "energy_t", "soc", "soc_vectors", "tdm_t",
+                        "phosphorescence_tdm", "osce_t",
                         "susceptibility_s", "susceptibility_t", "ground_polarization"):
                 if key in prediction:
                     collected.setdefault(key, []).append(prediction[key].cpu().numpy())
@@ -148,6 +149,11 @@ def main() -> None:
             atoms.info["MACE_soc_shape"] = np.array(collected["soc"][index].shape)
         if "soc_vectors" in collected:
             atoms.info["MACE_soc_vec"] = collected["soc_vectors"][index].reshape(-1)
+        if "tdm_t" in collected:
+            atoms.info["MACE_tdm_t"] = collected["tdm_t"][index].reshape(-1)
+            atoms.info["MACE_tdm_t_shape"] = np.array(collected["tdm_t"][index].shape)
+        if "phosphorescence_tdm" in collected:
+            atoms.info["MACE_tdm_t1_s0_eff"] = collected["phosphorescence_tdm"][index, 0].reshape(-1)
         for key, name in (("osce_t", "MACE_osce_t"), ("susceptibility_s", "MACE_d_s"),
                           ("susceptibility_t", "MACE_d_t")):
             if key in collected:
